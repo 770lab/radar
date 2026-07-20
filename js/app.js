@@ -1,7 +1,8 @@
 /* ============ RADAR — géoloc partagée en direct ============
  * Chaque visiteur qui accepte la géoloc apparaît sur la carte
  * de tous les autres, tant que sa page reste ouverte.
- * Présence : RTDB /presence/$uid + onDisconnect().remove()
+ * Présence : RTDB /presence/$pid (une clé par onglet, champ owner=uid)
+ * + onDisconnect().remove(). Lecture réservée aux visiteurs authentifiés.
  */
 (function () {
   'use strict';
@@ -12,6 +13,9 @@
   var HEARTBEAT_MS = 25 * 1000;    // refresh du timestamp sans mouvement
   var WRITE_MIN_MS = 2500;         // délai mini entre deux écritures de position
   var WRITE_MIN_METERS = 3;        // ou déplacement mini
+  var FIX_FRESH_MS = 90 * 1000;    // au-delà sans fix GPS réel : on cesse de diffuser
+  var COORD_DECIMALS = 4;          // précision partagée (~11 m) — pas la position exacte
+  var MAX_ACC = 100000;            // borne d'exactitude acceptée par les règles RTDB
   var SHARE_URL = 'https://770lab.com/radar/';
 
   var CALLSIGNS = [
@@ -28,7 +32,7 @@
 
   // ---------- État ----------
   var map, tiles;
-  var db, meRef, myUid = null;
+  var db, meRef, myUid = null, myPid = null;
   var joined = false;
   var joining = false;
   var gotFirstSnapshot = false;
@@ -37,10 +41,11 @@
   var watchId = null, heartbeatTimer = null, repaintTimer = null;
   var serverOffset = 0;
   var lastFix = null;            // dernier GeolocationPosition reçu
+  var lastFixAt = 0;             // Date.now() de ce dernier fix GPS réel
   var lastPayload = null;        // dernier objet écrit dans la DB
   var lastWriteAt = 0;
-  var people = {};               // uid -> data
-  var markers = {};              // uid -> { marker, sig }
+  var people = {};               // pid -> data (clé = session/onglet, pas uid)
+  var markers = {};              // pid -> { marker, sig }
   var accCircle = null;
   var knownUids = null;          // pour les toasts arrivée/départ
   var cleanedUids = {};          // zombies déjà nettoyés cette session
@@ -63,6 +68,11 @@
 
   function cleanName(raw) {
     return String(raw || '').replace(/\s+/g, ' ').trim().slice(0, 20);
+  }
+
+  function newSessionId() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID().slice(0, 8);
+    return Math.random().toString(36).slice(2, 10);
   }
 
   function hueFromUid(uid) {
@@ -160,7 +170,7 @@
       var age = now - (p.t || 0);
 
       // Nettoyage des zombies (crash sans onDisconnect) — une tentative max
-      if (age > ZOMBIE_MS && uid !== myUid) {
+      if (age > ZOMBIE_MS && uid !== myPid) {
         if (joined && !cleanedUids[uid]) {
           cleanedUids[uid] = true;
           db.ref('presence/' + uid).remove().catch(function () {});
@@ -171,7 +181,7 @@
 
       var stale = age > STALE_MS;
       if (!stale) liveCount++;
-      var isMe = uid === myUid;
+      var isMe = uid === myPid;
       var sig = [p.name, p.hue, stale, isMe].join('|');
       var entry = markers[uid];
 
@@ -248,8 +258,8 @@
       })
       .map(function (uid) {
         var p = people[uid];
-        var dist = (me && uid !== myUid) ? haversine(me.lat, me.lng, p.lat, p.lng) : -1;
-        return { uid: uid, p: p, dist: dist, isMe: uid === myUid, stale: (now - (p.t || 0)) > STALE_MS };
+        var dist = (me && uid !== myPid) ? haversine(me.lat, me.lng, p.lat, p.lng) : -1;
+        return { uid: uid, p: p, dist: dist, isMe: uid === myPid, stale: (now - (p.t || 0)) > STALE_MS };
       })
       .sort(function (a, b) {
         if (a.isMe) return -1;
@@ -297,7 +307,7 @@
     Object.keys(newPeople).forEach(function (uid) { newUids[uid] = true; });
     if (knownUids !== null) {
       Object.keys(newUids).forEach(function (uid) {
-        if (!knownUids[uid] && uid !== myUid) {
+        if (!knownUids[uid] && uid !== myPid) {
           var p = newPeople[uid];
           if (p && p.name && serverNow() - (p.t || 0) < STALE_MS) {
             toast('📡 ' + p.name + ' apparaît sur le radar');
@@ -305,7 +315,7 @@
         }
       });
       Object.keys(knownUids).forEach(function (uid) {
-        if (!newUids[uid] && uid !== myUid) {
+        if (!newUids[uid] && uid !== myPid) {
           var old = people[uid];
           // Pas de toast pour un nœud zombie nettoyé 10 min plus tard
           if (old && old.name && !cleanedUids[uid] && serverNow() - (old.t || 0) < STALE_MS * 2) {
@@ -326,7 +336,24 @@
       serverOffset = snap.val() || 0;
     });
 
-    // Lecture publique : la carte s'anime dès l'accueil
+    // La lecture de /presence exige d'être authentifié (bloque le scraping
+    // anonyme). On s'identifie donc dès le chargement, avant même de rejoindre :
+    // cela n'écrit AUCUNE position tant que l'utilisateur ne clique pas.
+    ensureAuth().then(subscribePresence).catch(function (err) {
+      console.error('[radar] auth init:', err);
+      elGateCount.textContent = 'Radar injoignable — réessaie plus tard.';
+    });
+
+    // Si rien ne répond, ne pas rester bloqué sur « Connexion au radar… »
+    setTimeout(function () {
+      if (!gotFirstSnapshot) {
+        elGateCount.textContent = 'Radar injoignable — vérifie ta connexion.';
+      }
+    }, 8000);
+  }
+
+  function subscribePresence() {
+    // La carte s'anime dès l'accueil (une fois authentifié)
     db.ref('presence').on('value', function (snap) {
       gotFirstSnapshot = true;
       var val = snap.val() || {};
@@ -338,20 +365,15 @@
       elGateCount.textContent = 'Radar injoignable — réessaie plus tard.';
     });
 
-    // Si rien ne répond, ne pas rester bloqué sur « Connexion au radar… »
-    setTimeout(function () {
-      if (!gotFirstSnapshot) {
-        elGateCount.textContent = 'Radar injoignable — vérifie ta connexion.';
-      }
-    }, 8000);
-
-    // Ré-armer la présence après une coupure réseau
+    // Ré-armer la présence après une coupure réseau (si le fix est encore frais)
     db.ref('.info/connected').on('value', function (snap) {
       if (snap.val() === true && joined && meRef && lastPayload) {
         meRef.onDisconnect().remove();
-        var refresh = Object.assign({}, lastPayload, { t: firebase.database.ServerValue.TIMESTAMP });
-        meRef.set(refresh).catch(function () {});
-        lastPayload.t = serverNow();
+        if (fixIsFresh()) {
+          var refresh = Object.assign({}, lastPayload, { t: firebase.database.ServerValue.TIMESTAMP });
+          meRef.set(refresh).catch(function () {});
+          lastPayload.t = serverNow();
+        }
       }
     });
   }
@@ -363,12 +385,18 @@
   }
 
   // ---------- Partage de position ----------
+  function roundCoord(x) {
+    var f = Math.pow(10, COORD_DECIMALS);
+    return Math.round(x * f) / f;
+  }
+
   function payloadFrom(fix, name, hue) {
     return {
+      owner: myUid,
       name: name,
-      lat: Math.round(fix.coords.latitude * 1e6) / 1e6,
-      lng: Math.round(fix.coords.longitude * 1e6) / 1e6,
-      acc: Math.round(fix.coords.accuracy || 0),
+      lat: roundCoord(fix.coords.latitude),
+      lng: roundCoord(fix.coords.longitude),
+      acc: Math.min(Math.round(fix.coords.accuracy || 0), MAX_ACC),
       hue: hue,
       t: firebase.database.ServerValue.TIMESTAMP
     };
@@ -394,6 +422,9 @@
     if (follow) panTo([payload.lat, payload.lng], Math.max(map.getZoom(), 15));
     repaint();
   }
+
+  // Un fix GPS réel est-il encore assez récent pour qu'on se dise « en direct » ?
+  function fixIsFresh() { return lastFixAt > 0 && (Date.now() - lastFixAt) < FIX_FRESH_MS; }
 
   function geoErrorMessage(err) {
     if (!err) return 'Erreur de géolocalisation inconnue.';
@@ -437,12 +468,16 @@
 
     ensureAuth().then(function (user) {
       myUid = user.uid;
-      meRef = db.ref('presence/' + myUid);
+      // Clé de présence propre à CET onglet : deux onglets du même compte
+      // ne se suppriment plus mutuellement à la fermeture.
+      myPid = user.uid + '-' + newSessionId();
+      meRef = db.ref('presence/' + myPid);
 
       if (watchId !== null) navigator.geolocation.clearWatch(watchId);
       watchId = navigator.geolocation.watchPosition(
         function (fix) {
           lastFix = fix;
+          lastFixAt = Date.now();
           if (joining && !joined) {
             // Premier fix : on apparaît
             joining = false;
@@ -462,6 +497,11 @@
             elJoin.disabled = false;
             elJoin.textContent = 'Apparaître sur le radar';
             showGateError(geoErrorMessage(err));
+          } else if (err.code === 1) {
+            // Permission retirée en cours de route : on ne diffuse pas une
+            // position figée comme « live ». Retrait immédiat du radar.
+            toast('Localisation coupée — tu as quitté le radar', true);
+            quit();
           } else {
             console.warn('[radar] geoloc:', err.message);
           }
@@ -504,7 +544,10 @@
     setTimeout(function () { suppressMoveEvents = false; }, 900);
 
     heartbeatTimer = setInterval(function () {
-      if (joined && meRef && lastPayload) {
+      // On ne rafraîchit « en direct » QUE si le GPS nous a donné un fix récent.
+      // Sinon (onglet en arrière-plan, GPS coupé), on laisse le nœud se périmer
+      // puis disparaître : pas de fausse présence figée.
+      if (joined && meRef && lastPayload && fixIsFresh()) {
         var refresh = Object.assign({}, lastPayload, { t: firebase.database.ServerValue.TIMESTAMP });
         meRef.set(refresh).catch(function () {});
         lastPayload.t = serverNow();
@@ -567,9 +610,19 @@
     if (lastPayload) panTo([lastPayload.lat, lastPayload.lng], Math.max(map.getZoom(), 15));
   });
 
-  // Retour d'onglet : rafraîchir tout de suite la présence
+  // Retour d'onglet : rafraîchir seulement si le dernier fix GPS est récent,
+  // sinon demander une position fraîche plutôt que rediffuser une vieille.
   document.addEventListener('visibilitychange', function () {
-    if (!document.hidden && joined && lastFix) writeFix(lastFix, true);
+    if (document.hidden || !joined) return;
+    if (fixIsFresh() && lastFix) {
+      writeFix(lastFix, true);
+    } else if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(function (fix) {
+        lastFix = fix;
+        lastFixAt = Date.now();
+        if (joined) writeFix(fix, true);
+      }, function () {}, { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
+    }
   });
   window.addEventListener('pagehide', function () {
     // onDisconnect s'en charge côté serveur ; on tente aussi localement
