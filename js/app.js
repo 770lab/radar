@@ -30,12 +30,12 @@
   var elCallsign = $('callsign'), elJoin = $('btn-join'), elReroll = $('btn-reroll');
   var elHud = $('hud'), elHudCount = $('hud-count'), elRoster = $('roster'), elToasts = $('toasts');
   var elMeetup = $('meetup'), elMeetDot = $('meet-dot'), elMeetName = $('meet-name'), elMeetSub = $('meet-sub');
-  var elTestbox = $('testbox'), elTestAddr = $('test-addr'), elTestGo = $('test-go'),
+  var elTestbox = $('testbox'), elTestAcSlot = $('test-ac-slot'),
       elTestStatus = $('test-status'), elTestRemove = $('test-remove'), elBtnTest = $('btn-test');
 
   // ---------- État ----------
   var map, mapReady = false, BlipOverlay = null;
-  var directionsSvc = null, geocoderSvc = null, placesAutocomplete = null;
+  var googleRoutes = null, placesLib = null, acEl = null;
   var db, meRef, myUid = null, myPid = null;
   var joined = false;
   var joining = false;
@@ -153,14 +153,13 @@
       defineBlipOverlay();
       map.addListener('dragstart', userMovedMap);
       map.addListener('zoom_changed', function () { if (!suppressMoveEvents) userMovedMap(); });
-      // Services Places (autocomplétion) + Directions (itinéraire piéton)
+      // Places (autocomplétion) + Routes (itinéraire piéton) — composants actuels
       Promise.all([
         google.maps.importLibrary('places'),
-        google.maps.importLibrary('routes'),
-        google.maps.importLibrary('geocoding')
-      ]).then(function () {
-        directionsSvc = new google.maps.DirectionsService();
-        geocoderSvc = new google.maps.Geocoder();
+        google.maps.importLibrary('routes')
+      ]).then(function (libs) {
+        placesLib = libs[0];
+        googleRoutes = libs[1];
         initPlaces();
       }).catch(function (e) { console.warn('[radar] libs Google:', e); });
       mapReady = true;
@@ -697,7 +696,7 @@
     elBtnTest.classList.toggle('active', willShow);
     if (willShow) {
       elTestRemove.classList.toggle('hidden', !testPoint);
-      setTimeout(function () { elTestAddr.focus(); }, 60);
+      setTimeout(function () { if (acEl && acEl.focus) acEl.focus(); }, 60);
     }
   }
 
@@ -713,40 +712,28 @@
     elTestbox.classList.add('hidden');
     elBtnTest.classList.remove('active');
     setTestStatus('');
-    if (label) elTestAddr.value = label;
     doRepaint();               // fait apparaître le point tout de suite
     selectMeet(TEST_PID);      // démarre le rendez-vous automatiquement
   }
 
-  // Autocomplétion Google Places directement sur le champ adresse
+  // Autocomplétion via le composant Google PlaceAutocompleteElement (Places « new »)
   function initPlaces() {
-    if (!google.maps.places || !google.maps.places.Autocomplete) return;
-    placesAutocomplete = new google.maps.places.Autocomplete(elTestAddr, {
-      fields: ['geometry', 'name', 'formatted_address']
-    });
-    placesAutocomplete.addListener('place_changed', function () {
-      var pl = placesAutocomplete.getPlace();
-      if (pl && pl.geometry && pl.geometry.location) {
-        placeTestAt(pl.geometry.location.lat(), pl.geometry.location.lng(), pl.formatted_address || pl.name);
-      }
-    });
-  }
-
-  // « Placer » / Entrée sans choisir de suggestion : géocodage Google du texte tapé
-  function placeTest() {
-    var q = (elTestAddr.value || '').trim();
-    if (!q) { setTestStatus('Entre d’abord une adresse.', true); return; }
-    if (!geocoderSvc) { setTestStatus('Carte en cours de chargement…', true); return; }
-    elTestGo.disabled = true;
-    setTestStatus('Recherche de l’adresse…');
-    geocoderSvc.geocode({ address: q, region: 'fr' }, function (results, status) {
-      elTestGo.disabled = false;
-      if (status === 'OK' && results && results[0]) {
-        var loc = results[0].geometry.location;
-        placeTestAt(loc.lat(), loc.lng(), results[0].formatted_address);
-      } else {
-        setTestStatus('Adresse introuvable — précise-la (ville, pays).', true);
-      }
+    if (!placesLib || !placesLib.PlaceAutocompleteElement) return;
+    try {
+      acEl = new placesLib.PlaceAutocompleteElement({});
+    } catch (e) { console.warn('[radar] PlaceAutocomplete:', e); return; }
+    acEl.id = 'test-ac';
+    if ('placeholder' in acEl) acEl.placeholder = 'Adresse à rejoindre (ex. 10 rue de Rivoli, Paris)';
+    elTestAcSlot.appendChild(acEl);
+    // Sélection d'une adresse → on place le point Test
+    acEl.addEventListener('gmp-select', function (ev) {
+      var pred = ev && ev.placePrediction;
+      if (!pred) return;
+      var place = pred.toPlace();
+      place.fetchFields({ fields: ['location', 'formattedAddress'] }).then(function () {
+        var loc = place.location;
+        if (loc) placeTestAt(loc.lat(), loc.lng(), place.formattedAddress || '');
+      }).catch(function () { setTestStatus('Adresse indisponible, réessaie.', true); });
     });
   }
 
@@ -756,26 +743,29 @@
     delete people[TEST_PID];
     removeMarker(TEST_PID);
     knownUids && delete knownUids[TEST_PID];
-    elTestAddr.value = '';
+    if (acEl && 'value' in acEl) { try { acEl.value = ''; } catch (e) {} }
     elTestRemove.classList.add('hidden');
     setTestStatus('Point Test retiré.');
     doRepaint();
   }
 
-  // ---------- Itinéraire piéton réel (Google Directions, mode marche) ----------
+  // ---------- Itinéraire piéton réel (Google Routes API, computeRoutes) ----------
   function fetchRoute(from, to) {
-    if (!directionsSvc) return Promise.resolve(null);
-    return directionsSvc.route({
+    if (!googleRoutes) return Promise.resolve(null);
+    return googleRoutes.Route.computeRoutes({
       origin: { lat: from[0], lng: from[1] },
       destination: { lat: to[0], lng: to[1] },
-      travelMode: google.maps.TravelMode.WALKING
+      travelMode: 'WALKING',
+      fields: ['path', 'distanceMeters', 'durationMillis']
     }).then(function (res) {
       var r = res && res.routes && res.routes[0];
-      var leg = r && r.legs && r.legs[0];
-      if (!r || !leg) return null;
-      var coords = (r.overview_path || []).map(function (pt) { return [pt.lat(), pt.lng()]; });
-      if (coords.length < 2) return null;
-      return { coords: coords, distance: leg.distance.value, duration: leg.duration.value };
+      if (!r || !r.path || r.path.length < 2) return null;
+      // path[] = littéraux {lat,lng} OU objets LatLng selon la version → gérer les deux
+      var coords = r.path.map(function (pt) {
+        return [typeof pt.lat === 'function' ? pt.lat() : pt.lat,
+                typeof pt.lng === 'function' ? pt.lng() : pt.lng];
+      });
+      return { coords: coords, distance: r.distanceMeters, duration: (r.durationMillis || 0) / 1000 };
     }).catch(function () { return null; });
   }
 
@@ -1099,13 +1089,6 @@
   $('btn-share').addEventListener('click', share);
   $('meet-close').addEventListener('click', function () { clearMeet(); });
   elBtnTest.addEventListener('click', toggleTestbox);
-  elTestGo.addEventListener('click', placeTest);
-  // Entrée : si Google Places n'a pas déjà placé le point (boîte encore ouverte), géocode le texte
-  elTestAddr.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') {
-      setTimeout(function () { if (!elTestbox.classList.contains('hidden')) placeTest(); }, 300);
-    }
-  });
   elTestRemove.addEventListener('click', removeTest);
   $('btn-center').addEventListener('click', function () {
     follow = true;

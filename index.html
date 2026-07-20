@@ -11,7 +11,7 @@
   <meta property="og:url" content="https://770lab.com/radar/">
   <meta name="theme-color" content="#e8edf3">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📡</text></svg>">
-  <link rel="stylesheet" href="css/style.css?v=9">
+  <link rel="stylesheet" href="css/style.css?v=10">
 </head>
 <body>
 
@@ -35,12 +35,8 @@
 
   <!-- Boîte « point de test » (adresse à rejoindre) -->
   <div id="testbox" class="hidden">
-    <div class="testbox-row">
-      <input id="test-addr" type="text" autocomplete="off" spellcheck="false"
-             aria-label="Adresse à rejoindre"
-             placeholder="Adresse à rejoindre (ex. 10 rue de Rivoli, Paris)">
-      <button id="test-go" type="button">Placer</button>
-    </div>
+    <!-- Le composant Google PlaceAutocompleteElement est injecté ici -->
+    <div class="testbox-row" id="test-ac-slot"></div>
     <div class="testbox-foot">
       <span id="test-status" class="test-status">Un point « Test » apparaîtra à cette adresse, clique-le pour t’y rendre.</span>
       <button id="test-remove" class="test-remove hidden" type="button">Retirer le point Test</button>
@@ -104,6 +100,6 @@
   <script src="vendor/firebase/firebase-app-compat.js"></script>
   <script src="vendor/firebase/firebase-auth-compat.js"></script>
   <script src="vendor/firebase/firebase-database-compat.js"></script>
-  <script src="js/app.js?v=9"></script>
+  <script src="js/app.js?v=11"></script>
 </body>
 </html>
