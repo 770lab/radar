@@ -1,0 +1,32 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "presence": {
+      ".read": true,
+      "$uid": {
+        ".write": "auth != null && (auth.uid === $uid || (!newData.exists() && data.exists() && data.child('t').val() < now - 600000))",
+        ".validate": "newData.hasChildren(['name', 'lat', 'lng', 't', 'hue', 'acc'])",
+        "name": {
+          ".validate": "newData.isString() && newData.val().length >= 1 && newData.val().length <= 24"
+        },
+        "lat": {
+          ".validate": "newData.isNumber() && newData.val() >= -90 && newData.val() <= 90"
+        },
+        "lng": {
+          ".validate": "newData.isNumber() && newData.val() >= -180 && newData.val() <= 180"
+        },
+        "acc": {
+          ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 100000"
+        },
+        "hue": {
+          ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() < 360"
+        },
+        "t": {
+          ".validate": "newData.isNumber() && newData.val() > now - 60000 && newData.val() < now + 60000"
+        },
+        "$other": { ".validate": false }
+      }
+    }
+  }
+}
