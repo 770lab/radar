@@ -18,16 +18,22 @@ Rien n'est enregistré.
 
 ## Fonctionnement
 
-- **Front** : statique (GitHub Pages), vanilla JS + [Leaflet](https://leafletjs.com)
-  (tuiles CARTO `light_all`), tout vendorisé dans `vendor/`.
+- **Front** : statique (GitHub Pages), vanilla JS + **Google Maps JavaScript API**
+  (carte, marqueurs custom via OverlayView, Places Autocomplete, Directions
+  piéton). Clé Maps du projet `geo-loc-489602`, **verrouillée sur 770lab.com**
+  (voir `js/config.js`). Firebase vendorisé dans `vendor/`.
 - **Temps réel** : Firebase Realtime Database (`radar-770lab`, europe-west1),
   auth anonyme.
 - **Présence** : `/presence/$pid` (une clé par onglet, champ `owner`=uid) avec
   `onDisconnect().remove()` (disparition auto à la fermeture), heartbeat 25 s,
   blip grisé après 75 s sans signe de vie, nettoyage des nœuds zombie après
   10 min. Le rendez-vous visé est publié dans le champ optionnel `target`.
-- **Temps estimé** : distance / vitesse de rapprochement (mesurée sur ~45 s,
-  plafonnée à 30 m/s pour ignorer les sauts GPS) ; repli marche ~5 km/h.
+- **Se rejoindre** : itinéraire piéton réel (Google Directions, mode marche)
+  qui suit les rues ; distance + durée du trajet recalculées à mesure qu'on
+  avance. Repli « à vol d'oiseau » (régression sur ~20 s) si l'itinéraire n'est
+  pas encore prêt.
+- **Point de test** : bouton ＋ → adresse (autocomplétion Google Places) → point
+  « Test » local (jamais écrit en base) pour essayer le rendez-vous seul.
 
 ## Sécurité / vie privée
 

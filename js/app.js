@@ -31,11 +31,11 @@
   var elHud = $('hud'), elHudCount = $('hud-count'), elRoster = $('roster'), elToasts = $('toasts');
   var elMeetup = $('meetup'), elMeetDot = $('meet-dot'), elMeetName = $('meet-name'), elMeetSub = $('meet-sub');
   var elTestbox = $('testbox'), elTestAddr = $('test-addr'), elTestGo = $('test-go'),
-      elTestStatus = $('test-status'), elTestRemove = $('test-remove'), elBtnTest = $('btn-test'),
-      elTestSuggest = $('test-suggest');
+      elTestStatus = $('test-status'), elTestRemove = $('test-remove'), elBtnTest = $('btn-test');
 
   // ---------- État ----------
-  var map, tiles;
+  var map, mapReady = false, BlipOverlay = null;
+  var directionsSvc = null, geocoderSvc = null, placesAutocomplete = null;
   var db, meRef, myUid = null, myPid = null;
   var joined = false;
   var joining = false;
@@ -67,9 +67,6 @@
   // ---- Point de test (destination fictive locale, jamais écrite en base) ----
   var TEST_PID = '__test__';
   var testPoint = null;          // { name, lat, lng, hue }
-  var suggestItems = [];         // suggestions d'adresses courantes
-  var suggestActive = -1;        // index surligné au clavier
-  var suggestTimer = null;
   // ---- Itinéraire piéton réel (suit les rues) ----
   var route = null;              // { coords:[[lat,lng]], distance, duration, from, to, at }
   var routeFetching = false;
@@ -132,32 +129,90 @@
     while (elToasts.children.length > 4) elToasts.firstChild.remove();
   }
 
-  // ---------- Carte ----------
+  // ---------- Carte (Google Maps) ----------
+  // Style clair épuré : on masque les POI/transports pour ne pas noyer les blips.
+  var MAP_STYLE = [
+    { featureType: 'poi', stylers: [{ visibility: 'off' }] },
+    { featureType: 'transit', stylers: [{ visibility: 'off' }] },
+    { featureType: 'road', elementType: 'labels.icon', stylers: [{ visibility: 'off' }] }
+  ];
+
   function initMap() {
-    map = L.map('map', {
-      center: [46.6, 2.4], // France par défaut
-      zoom: 6,
-      zoomControl: false,
-      attributionControl: true,
-      worldCopyJump: true
+    google.maps.importLibrary('maps').then(function (lib) {
+      map = new lib.Map(document.getElementById('map'), {
+        center: { lat: 46.6, lng: 2.4 }, // France par défaut
+        zoom: 6,
+        maxZoom: 18,            // évite le zoom « niveau immeuble » (fitBounds de points proches)
+        disableDefaultUI: true,
+        zoomControl: false,
+        gestureHandling: 'greedy',
+        clickableIcons: false,
+        keyboardShortcuts: false,
+        styles: MAP_STYLE
+      });
+      defineBlipOverlay();
+      map.addListener('dragstart', userMovedMap);
+      map.addListener('zoom_changed', function () { if (!suppressMoveEvents) userMovedMap(); });
+      // Services Places (autocomplétion) + Directions (itinéraire piéton)
+      Promise.all([
+        google.maps.importLibrary('places'),
+        google.maps.importLibrary('routes'),
+        google.maps.importLibrary('geocoding')
+      ]).then(function () {
+        directionsSvc = new google.maps.DirectionsService();
+        geocoderSvc = new google.maps.Geocoder();
+        initPlaces();
+      }).catch(function (e) { console.warn('[radar] libs Google:', e); });
+      mapReady = true;
+      repaint();
+    }).catch(function (e) {
+      console.error('[radar] Google Maps:', e);
+      elGateCount.textContent = 'Carte indisponible — réessaie plus tard.';
     });
-    tiles = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
-      subdomains: 'abcd',
-      maxZoom: 19
-    });
-    tiles.addTo(map);
-    map.on('dragstart', userMovedMap);
-    map.on('zoomstart', function () { if (!suppressMoveEvents) userMovedMap(); });
   }
 
-  function userMovedMap() { follow = false; }
+  function userMovedMap() { if (!suppressMoveEvents) follow = false; }
 
   function panTo(latlng, zoom) {
+    if (!map) return;
     suppressMoveEvents = true;
-    map.setView(latlng, zoom || Math.max(map.getZoom(), 15), { animate: true });
+    map.panTo({ lat: latlng[0], lng: latlng[1] });
+    map.setZoom(zoom || Math.max(map.getZoom(), 15));
     setTimeout(function () { suppressMoveEvents = false; }, 900);
   }
+
+  // Marqueur HTML personnalisé via OverlayView (blips colorés animés)
+  function defineBlipOverlay() {
+    function Blip(ll, html, onClick, z) {
+      this._ll = ll; this._html = html; this._onClick = onClick; this._z = z || 0;
+      this.setMap(map);
+    }
+    Blip.prototype = new google.maps.OverlayView();
+    Blip.prototype.onAdd = function () {
+      var d = document.createElement('div');
+      d.className = 'blip-ov';
+      d.style.zIndex = this._z;
+      d.innerHTML = this._html;
+      d.addEventListener('click', this._onClick);
+      this._div = d;
+      this.getPanes().overlayMouseTarget.appendChild(d);
+    };
+    Blip.prototype.draw = function () {
+      if (!this._div) return;
+      var proj = this.getProjection();
+      if (!proj) return;
+      var pt = proj.fromLatLngToDivPixel(this._ll);
+      if (!pt) return;
+      this._div.style.left = pt.x + 'px';
+      this._div.style.top = pt.y + 'px';
+    };
+    Blip.prototype.onRemove = function () { if (this._div) { this._div.remove(); this._div = null; } };
+    Blip.prototype.setLL = function (ll) { this._ll = ll; this.draw(); };
+    Blip.prototype.setHtml = function (html) { this._html = html; if (this._div) this._div.innerHTML = html; };
+    Blip.prototype.setZ = function (z) { this._z = z; if (this._div) this._div.style.zIndex = z; };
+    BlipOverlay = Blip;
+  }
+  function LL(lat, lng) { return new google.maps.LatLng(lat, lng); }
 
   // ---------- Rendu des présents ----------
   function markerHtml(p, isMe, stale, selected) {
@@ -205,22 +260,22 @@
 
       var stale = age > STALE_MS;
       if (!stale) liveCount++;
+      if (!mapReady) return;   // en attente de la carte : on compte, on ne dessine pas
       var isMe = uid === myPid;
       var selected = uid === selectedPid;
+      var z = isMe ? 1000 : (selected ? 800 : 100);
       var sig = [p.name, p.hue, stale, isMe, selected].join('|');
       var entry = markers[uid];
 
       if (!entry) {
-        var icon = L.divIcon({ className: 'blip', html: markerHtml(p, isMe, stale, selected), iconSize: [0, 0] });
-        var m = L.marker([p.lat, p.lng], { icon: icon, keyboard: false, zIndexOffset: isMe ? 1000 : (selected ? 800 : 0) });
-        m.on('click', (function (id) { return function () { onPersonClick(id); }; })(uid));
-        m.addTo(map);
-        markers[uid] = { marker: m, sig: sig };
+        var ov = new BlipOverlay(LL(p.lat, p.lng), markerHtml(p, isMe, stale, selected),
+          (function (id) { return function () { onPersonClick(id); }; })(uid), z);
+        markers[uid] = { marker: ov, sig: sig };
       } else {
-        entry.marker.setLatLng([p.lat, p.lng]);
+        entry.marker.setLL(LL(p.lat, p.lng));
         if (entry.sig !== sig) {
-          entry.marker.setIcon(L.divIcon({ className: 'blip', html: markerHtml(p, isMe, stale, selected), iconSize: [0, 0] }));
-          entry.marker.setZIndexOffset(isMe ? 1000 : (selected ? 800 : 0));
+          entry.marker.setHtml(markerHtml(p, isMe, stale, selected));
+          entry.marker.setZ(z);
           entry.sig = sig;
         }
       }
@@ -232,20 +287,21 @@
     });
 
     // Cercle de précision (moi)
-    if (joined && lastPayload) {
+    if (mapReady && joined && lastPayload) {
       var acc = Math.min(lastPayload.acc || 0, 2000);
       if (acc > 15) {
         if (!accCircle) {
-          accCircle = L.circle([lastPayload.lat, lastPayload.lng], {
-            radius: acc, color: '#4af68a', weight: 1, opacity: 0.35,
-            fillColor: '#4af68a', fillOpacity: 0.07, interactive: false
-          }).addTo(map);
+          accCircle = new google.maps.Circle({
+            map: map, center: { lat: lastPayload.lat, lng: lastPayload.lng }, radius: acc,
+            strokeColor: '#0f9d8c', strokeOpacity: 0.35, strokeWeight: 1,
+            fillColor: '#0f9d8c', fillOpacity: 0.07, clickable: false
+          });
         } else {
-          accCircle.setLatLng([lastPayload.lat, lastPayload.lng]);
+          accCircle.setCenter({ lat: lastPayload.lat, lng: lastPayload.lng });
           accCircle.setRadius(acc);
         }
       } else if (accCircle) {
-        accCircle.remove();
+        accCircle.setMap(null);
         accCircle = null;
       }
     }
@@ -258,7 +314,7 @@
 
   function removeMarker(uid) {
     if (markers[uid]) {
-      markers[uid].marker.remove();
+      markers[uid].marker.setMap(null);
       delete markers[uid];
     }
   }
@@ -394,10 +450,18 @@
     rosterSig = '';                // forcer le re-rendu des chips (état sélection)
     toast('🎯 Cap sur ' + (p.name || '?') + ' — suis le trait', false, true);
     follow = false;
-    // cadrer les deux points
-    if (lastPayload) {
+    // cadrer les deux points (sauf s'ils sont quasi confondus → zoom raisonnable)
+    if (lastPayload && map) {
       suppressMoveEvents = true;
-      map.fitBounds(L.latLngBounds([[lastPayload.lat, lastPayload.lng], [p.lat, p.lng]]).pad(0.3), { maxZoom: 16 });
+      if (haversine(lastPayload.lat, lastPayload.lng, p.lat, p.lng) > 40) {
+        var b = new google.maps.LatLngBounds();
+        b.extend({ lat: lastPayload.lat, lng: lastPayload.lng });
+        b.extend({ lat: p.lat, lng: p.lng });
+        map.fitBounds(b, 70);
+      } else {
+        map.panTo({ lat: p.lat, lng: p.lng });
+        map.setZoom(16);
+      }
       setTimeout(function () { suppressMoveEvents = false; }, 900);
     }
     broadcastSelection();          // la cible verra « X vient te rejoindre »
@@ -535,8 +599,8 @@
 
     elMeetup.classList.remove('hidden');
     document.body.classList.add('has-meet');
-    // Le trait suit l'itinéraire réel s'il est prêt, sinon segment direct
-    drawMeetLine(routeValid ? route.coords : [me, to], confirmed);
+    // Le trait suit l'itinéraire réel s'il est prêt (plein), sinon segment direct (pointillé)
+    drawMeetLine(routeValid ? route.coords : [me, to], confirmed, !routeValid);
   }
 
   function hideMeetup() {
@@ -547,25 +611,25 @@
     clearMeetLine();
   }
 
-  function drawMeetLine(latlngs, confirmed) {
-    var opts = {
-      color: confirmed ? '#0f9d8c' : '#f97316',
-      weight: confirmed ? 5 : 4,
-      opacity: 0.9,
-      lineCap: 'round',
-      lineJoin: 'round',
-      interactive: false
-    };
-    if (!meetLine) {
-      meetLine = L.polyline(latlngs, opts).addTo(map);
+  var DASH_SYMBOL = { path: 'M 0,-1 0,1', strokeOpacity: 0.95, strokeWeight: 4, scale: 3 };
+  function drawMeetLine(latlngs, confirmed, dashed) {
+    if (!map) return;
+    var color = confirmed ? '#0f9d8c' : '#f97316';
+    var path = latlngs.map(function (c) { return { lat: c[0], lng: c[1] }; });
+    if (!meetLine) meetLine = new google.maps.Polyline({ map: map, clickable: false, zIndex: 50 });
+    if (dashed) {
+      meetLine.setOptions({
+        strokeOpacity: 0, strokeColor: color,
+        icons: [{ icon: Object.assign({ strokeColor: color }, DASH_SYMBOL), offset: '0', repeat: '14px' }]
+      });
     } else {
-      meetLine.setLatLngs(latlngs);
-      meetLine.setStyle(opts);
+      meetLine.setOptions({ strokeColor: color, strokeOpacity: 0.95, strokeWeight: confirmed ? 6 : 5, icons: [] });
     }
+    meetLine.setPath(path);
   }
 
   function clearMeetLine() {
-    if (meetLine) { meetLine.remove(); meetLine = null; }
+    if (meetLine) { meetLine.setMap(null); meetLine = null; }
   }
 
   // Lignes de ceux qui me visent (« X vient vers moi ») + toast anti-répétition
@@ -574,7 +638,7 @@
   function updateIncoming(now) {
     var targetingMe = {};          // me vise réellement (indépendant de la fraîcheur)
     var drawn = 0;
-    if (joined && lastPayload) {
+    if (mapReady && joined && lastPayload) {
       Object.keys(people).forEach(function (pid) {
         if (pid === myPid) return;
         var p = people[pid];
@@ -592,13 +656,17 @@
         if (pid === selectedPid) { removeIncomingLine(pid); return; }
         if (drawn >= INCOMING_MAX_LINES) { removeIncomingLine(pid); return; }
         drawn++;
-        var opts = { color: colorFor(p.hue || 0), weight: 2.5, opacity: 0.6, dashArray: '2 7', lineCap: 'round', interactive: false };
+        var color = colorFor(p.hue || 0);
+        var path = [{ lat: p.lat, lng: p.lng }, { lat: lastPayload.lat, lng: lastPayload.lng }];
         if (!incomingLines[pid]) {
-          incomingLines[pid] = L.polyline([[p.lat, p.lng], [lastPayload.lat, lastPayload.lng]], opts).addTo(map);
+          incomingLines[pid] = new google.maps.Polyline({
+            map: map, clickable: false, strokeOpacity: 0, zIndex: 40,
+            icons: [{ icon: Object.assign({ strokeColor: color }, DASH_SYMBOL, { strokeWeight: 3, scale: 2.5 }), offset: '0', repeat: '13px' }]
+          });
         } else {
-          incomingLines[pid].setLatLngs([[p.lat, p.lng], [lastPayload.lat, lastPayload.lng]]);
-          incomingLines[pid].setStyle(opts);
+          incomingLines[pid].setOptions({ icons: [{ icon: Object.assign({ strokeColor: color }, DASH_SYMBOL, { strokeWeight: 3, scale: 2.5 }), offset: '0', repeat: '13px' }] });
         }
+        incomingLines[pid].setPath(path);
       });
     }
     // Retirer les traits de ceux qui ne sont plus frais / ne me visent plus
@@ -613,7 +681,7 @@
   }
 
   function removeIncomingLine(pid) {
-    if (incomingLines[pid]) { incomingLines[pid].remove(); delete incomingLines[pid]; }
+    if (incomingLines[pid]) { incomingLines[pid].setMap(null); delete incomingLines[pid]; }
   }
 
   // ---------- Point de test (destination fictive pour essayer seul) ----------
@@ -638,30 +706,9 @@
     elTestStatus.classList.toggle('err', !!err);
   }
 
-  // Géocodage via Photon (OpenStreetMap, gratuit, CORS ouvert, sans clé)
-  // Retourne une liste [{lat, lng, main, sub}] (autocomplétion).
-  function geocodeList(q, limit) {
-    var url = 'https://photon.komoot.io/api/?limit=' + (limit || 5) + '&lang=fr&q=' + encodeURIComponent(q);
-    return fetch(url).then(function (r) { return r.json(); }).then(function (j) {
-      if (!j || !j.features) return [];
-      return j.features.map(function (f) {
-        var c = f.geometry && f.geometry.coordinates, p = f.properties || {};
-        if (!c || typeof c[0] !== 'number' || typeof c[1] !== 'number') return null;
-        var street = p.housenumber ? (p.housenumber + ' ' + (p.street || '')).trim() : (p.street || '');
-        var main = p.name || street || p.city || 'Lieu';
-        if (p.name && street && p.name !== street) main = p.name; // POI garde son nom
-        var loc = [street && street !== main ? street : null,
-                   p.postcode, p.city || p.town || p.village, p.country]
-                  .filter(Boolean).join(', ');
-        return { lat: c[1], lng: c[0], main: main, sub: loc };
-      }).filter(Boolean);
-    });
-  }
-
   function placeTestAt(lat, lng, label) {
     testPoint = { name: 'Test', lat: lat, lng: lng, hue: 300 };
     route = null; routeFailed = false;   // recalcul de l'itinéraire pour la nouvelle cible
-    hideSuggest();
     elTestRemove.classList.remove('hidden');
     elTestbox.classList.add('hidden');
     elBtnTest.classList.remove('active');
@@ -671,83 +718,36 @@
     selectMeet(TEST_PID);      // démarre le rendez-vous automatiquement
   }
 
+  // Autocomplétion Google Places directement sur le champ adresse
+  function initPlaces() {
+    if (!google.maps.places || !google.maps.places.Autocomplete) return;
+    placesAutocomplete = new google.maps.places.Autocomplete(elTestAddr, {
+      fields: ['geometry', 'name', 'formatted_address']
+    });
+    placesAutocomplete.addListener('place_changed', function () {
+      var pl = placesAutocomplete.getPlace();
+      if (pl && pl.geometry && pl.geometry.location) {
+        placeTestAt(pl.geometry.location.lat(), pl.geometry.location.lng(), pl.formatted_address || pl.name);
+      }
+    });
+  }
+
+  // « Placer » / Entrée sans choisir de suggestion : géocodage Google du texte tapé
   function placeTest() {
     var q = (elTestAddr.value || '').trim();
     if (!q) { setTestStatus('Entre d’abord une adresse.', true); return; }
+    if (!geocoderSvc) { setTestStatus('Carte en cours de chargement…', true); return; }
     elTestGo.disabled = true;
     setTestStatus('Recherche de l’adresse…');
-    geocodeList(q, 1).then(function (list) {
+    geocoderSvc.geocode({ address: q, region: 'fr' }, function (results, status) {
       elTestGo.disabled = false;
-      if (!list.length) { setTestStatus('Adresse introuvable — précise-la (ville, pays).', true); return; }
-      placeTestAt(list[0].lat, list[0].lng);
-    }).catch(function () {
-      elTestGo.disabled = false;
-      setTestStatus('Recherche impossible (réseau).', true);
+      if (status === 'OK' && results && results[0]) {
+        var loc = results[0].geometry.location;
+        placeTestAt(loc.lat(), loc.lng(), results[0].formatted_address);
+      } else {
+        setTestStatus('Adresse introuvable — précise-la (ville, pays).', true);
+      }
     });
-  }
-
-  // ---- Autocomplétion ----
-  function onAddrInput() {
-    var q = (elTestAddr.value || '').trim();
-    if (suggestTimer) clearTimeout(suggestTimer);
-    if (q.length < 3) { hideSuggest(); return; }
-    suggestTimer = setTimeout(function () {
-      geocodeList(q, 6).then(renderSuggest).catch(function () { hideSuggest(); });
-    }, 250);
-  }
-
-  function renderSuggest(list) {
-    suggestItems = list || [];
-    suggestActive = -1;
-    if (!suggestItems.length) { hideSuggest(); return; }
-    elTestSuggest.innerHTML = '';
-    suggestItems.forEach(function (s, i) {
-      var li = document.createElement('li');
-      li.setAttribute('role', 'option');
-      var m = document.createElement('span'); m.className = 's-main'; m.textContent = s.main;
-      var sub = document.createElement('span'); sub.className = 's-sub'; sub.textContent = s.sub || '';
-      li.appendChild(m); if (s.sub) li.appendChild(sub);
-      li.addEventListener('mousedown', function (e) { e.preventDefault(); chooseSuggest(i); });
-      elTestSuggest.appendChild(li);
-    });
-    elTestSuggest.classList.remove('hidden');
-    elTestAddr.setAttribute('aria-expanded', 'true');
-  }
-
-  function hideSuggest() {
-    elTestSuggest.classList.add('hidden');
-    elTestSuggest.innerHTML = '';
-    suggestItems = [];
-    suggestActive = -1;
-    elTestAddr.setAttribute('aria-expanded', 'false');
-  }
-
-  function highlightSuggest(idx) {
-    var items = elTestSuggest.children;
-    for (var i = 0; i < items.length; i++) items[i].classList.toggle('active', i === idx);
-    suggestActive = idx;
-  }
-
-  function chooseSuggest(i) {
-    var s = suggestItems[i];
-    if (!s) return;
-    placeTestAt(s.lat, s.lng, [s.main, s.sub].filter(Boolean).join(', '));
-  }
-
-  function onAddrKeydown(e) {
-    var n = suggestItems.length;
-    if (n && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
-      e.preventDefault();
-      var idx = suggestActive + (e.key === 'ArrowDown' ? 1 : -1);
-      if (idx < 0) idx = n - 1; if (idx >= n) idx = 0;
-      highlightSuggest(idx);
-    } else if (e.key === 'Enter') {
-      e.preventDefault();
-      if (suggestActive >= 0) chooseSuggest(suggestActive);
-      else placeTest();
-    } else if (e.key === 'Escape') {
-      hideSuggest();
-    }
   }
 
   function removeTest() {
@@ -756,25 +756,27 @@
     delete people[TEST_PID];
     removeMarker(TEST_PID);
     knownUids && delete knownUids[TEST_PID];
-    hideSuggest();
     elTestAddr.value = '';
     elTestRemove.classList.add('hidden');
     setTestStatus('Point Test retiré.');
     doRepaint();
   }
 
-  // ---------- Itinéraire piéton réel (suit les rues, via OSRM piéton FOSSGIS) ----------
+  // ---------- Itinéraire piéton réel (Google Directions, mode marche) ----------
   function fetchRoute(from, to) {
-    var url = 'https://routing.openstreetmap.de/routed-foot/route/v1/foot/' +
-      from[1] + ',' + from[0] + ';' + to[1] + ',' + to[0] +
-      '?overview=full&geometries=geojson';
-    return fetch(url).then(function (r) { return r.json(); }).then(function (j) {
-      if (!j || j.code !== 'Ok' || !j.routes || !j.routes.length) return null;
-      var rt = j.routes[0];
-      var coords = (rt.geometry && rt.geometry.coordinates || []).map(function (c) { return [c[1], c[0]]; });
+    if (!directionsSvc) return Promise.resolve(null);
+    return directionsSvc.route({
+      origin: { lat: from[0], lng: from[1] },
+      destination: { lat: to[0], lng: to[1] },
+      travelMode: google.maps.TravelMode.WALKING
+    }).then(function (res) {
+      var r = res && res.routes && res.routes[0];
+      var leg = r && r.legs && r.legs[0];
+      if (!r || !leg) return null;
+      var coords = (r.overview_path || []).map(function (pt) { return [pt.lat(), pt.lng()]; });
       if (coords.length < 2) return null;
-      return { coords: coords, distance: rt.distance, duration: rt.duration };
-    });
+      return { coords: coords, distance: leg.distance.value, duration: leg.duration.value };
+    }).catch(function () { return null; });
   }
 
   function maybeFetchRoute(from, to) {
@@ -1004,12 +1006,18 @@
       if (p && typeof p.lat === 'number' && now - (p.t || 0) < STALE_MS) pts.push([p.lat, p.lng]);
     });
     if (lastPayload) pts.push([lastPayload.lat, lastPayload.lng]);
+    // Étendue réelle des points (évite un fitBounds sur des positions quasi confondues)
+    var maxD = 0;
+    if (lastPayload) pts.forEach(function (c) { maxD = Math.max(maxD, haversine(lastPayload.lat, lastPayload.lng, c[0], c[1])); });
     suppressMoveEvents = true;
-    if (pts.length > 1) {
-      map.fitBounds(L.latLngBounds(pts).pad(0.25), { maxZoom: 15 });
+    if (map && pts.length > 1 && maxD > 40) {
+      var b = new google.maps.LatLngBounds();
+      pts.forEach(function (c) { b.extend({ lat: c[0], lng: c[1] }); });
+      map.fitBounds(b, 70);
       follow = false;
-    } else if (lastPayload) {
-      map.setView([lastPayload.lat, lastPayload.lng], 15);
+    } else if (map && lastPayload) {
+      map.panTo({ lat: lastPayload.lat, lng: lastPayload.lng });
+      map.setZoom(16);
       follow = true;
     }
     setTimeout(function () { suppressMoveEvents = false; }, 900);
@@ -1092,9 +1100,12 @@
   $('meet-close').addEventListener('click', function () { clearMeet(); });
   elBtnTest.addEventListener('click', toggleTestbox);
   elTestGo.addEventListener('click', placeTest);
-  elTestAddr.addEventListener('input', onAddrInput);
-  elTestAddr.addEventListener('keydown', onAddrKeydown);
-  elTestAddr.addEventListener('blur', function () { setTimeout(hideSuggest, 120); });
+  // Entrée : si Google Places n'a pas déjà placé le point (boîte encore ouverte), géocode le texte
+  elTestAddr.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') {
+      setTimeout(function () { if (!elTestbox.classList.contains('hidden')) placeTest(); }, 300);
+    }
+  });
   elTestRemove.addEventListener('click', removeTest);
   $('btn-center').addEventListener('click', function () {
     follow = true;

@@ -5,5 +5,7 @@ window.RADAR_CONFIG = {
   authDomain: "radar-770lab.firebaseapp.com",
   databaseURL: "https://radar-770lab-default-rtdb.europe-west1.firebasedatabase.app",
   projectId: "radar-770lab",
-  appId: "1:765609551650:web:bad267e66ec515654a277b"
+  appId: "1:765609551650:web:bad267e66ec515654a277b",
+  // Clé Google Maps (projet geo-loc-489602), verrouillée sur 770lab.com.
+  mapsKey: "AIzaSyBptRvFExynV58vbkY_kwurGz3oX5mr0t0"
 };
