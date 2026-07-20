@@ -29,6 +29,7 @@
   var elGate = $('gate'), elGateCount = $('gate-count'), elGateError = $('gate-error');
   var elCallsign = $('callsign'), elJoin = $('btn-join'), elReroll = $('btn-reroll');
   var elHud = $('hud'), elHudCount = $('hud-count'), elRoster = $('roster'), elToasts = $('toasts');
+  var elMeetup = $('meetup'), elMeetDot = $('meet-dot'), elMeetName = $('meet-name'), elMeetSub = $('meet-sub');
 
   // ---------- État ----------
   var map, tiles;
@@ -52,6 +53,14 @@
   var rosterSig = '';            // évite de reconstruire le roster à l'identique
   var repaintQueued = false;
   var lastRepaintAt = 0;
+  // ---- Rendez-vous (« se rejoindre ») ----
+  var selectedPid = null;        // la personne que je veux rejoindre
+  var meetLine = null;           // trait Leaflet moi -> cible
+  var meetSamples = [];          // [{t, d}] pour estimer le temps restant
+  var incomingLines = {};        // pid -> trait de ceux qui viennent VERS moi
+  var knownIncoming = {};        // pid -> timestamp du dernier toast « X vient te rejoindre »
+  var meetNameTxt = '';          // dernier HTML écrit (évite la ré-annonce lecteur d'écran)
+  var meetSubTxt = '';
 
   // ---------- Utilitaires ----------
   function escapeHtml(s) {
@@ -81,7 +90,7 @@
     return h % 360;
   }
 
-  function colorFor(hue) { return 'hsl(' + hue + ', 90%, 62%)'; }
+  function colorFor(hue) { return 'hsl(' + hue + ', 72%, 45%)'; } /* contraste sur fond clair */
 
   function serverNow() { return Date.now() + serverOffset; }
 
@@ -101,9 +110,9 @@
     return Math.round(m / 1000) + ' km';
   }
 
-  function toast(msg, off) {
+  function toast(msg, off, meet) {
     var el = document.createElement('div');
-    el.className = 'toast' + (off ? ' toast-off' : '');
+    el.className = 'toast' + (off ? ' toast-off' : '') + (meet ? ' toast-meet' : '');
     el.textContent = msg;
     elToasts.appendChild(el);
     setTimeout(function () { el.remove(); }, 4200);
@@ -119,7 +128,7 @@
       attributionControl: true,
       worldCopyJump: true
     });
-    tiles = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+    tiles = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
       subdomains: 'abcd',
       maxZoom: 19
@@ -138,9 +147,10 @@
   }
 
   // ---------- Rendu des présents ----------
-  function markerHtml(p, isMe, stale) {
+  function markerHtml(p, isMe, stale, selected) {
     var color = colorFor(p.hue || 0);
-    return '<div class="blip-inner' + (stale ? ' blip-stale' : '') + '" style="--c:' + color + '">' +
+    var cls = 'blip-inner' + (stale ? ' blip-stale' : '') + (isMe ? ' blip-me' : '') + (selected ? ' blip-selected' : '');
+    return '<div class="' + cls + '" style="--c:' + color + '">' +
       '<div class="blip-pulse"></div>' +
       '<div class="blip-dot"></div>' +
       '<div class="blip-label">' + escapeHtml(p.name || '?') + (isMe ? ' (moi)' : '') + '</div>' +
@@ -182,19 +192,21 @@
       var stale = age > STALE_MS;
       if (!stale) liveCount++;
       var isMe = uid === myPid;
-      var sig = [p.name, p.hue, stale, isMe].join('|');
+      var selected = uid === selectedPid;
+      var sig = [p.name, p.hue, stale, isMe, selected].join('|');
       var entry = markers[uid];
 
       if (!entry) {
-        var icon = L.divIcon({ className: 'blip', html: markerHtml(p, isMe, stale), iconSize: [0, 0] });
-        var m = L.marker([p.lat, p.lng], { icon: icon, keyboard: false, zIndexOffset: isMe ? 1000 : 0 });
-        m.on('click', function () { panTo([people[uid].lat, people[uid].lng]); });
+        var icon = L.divIcon({ className: 'blip', html: markerHtml(p, isMe, stale, selected), iconSize: [0, 0] });
+        var m = L.marker([p.lat, p.lng], { icon: icon, keyboard: false, zIndexOffset: isMe ? 1000 : (selected ? 800 : 0) });
+        m.on('click', (function (id) { return function () { onPersonClick(id); }; })(uid));
         m.addTo(map);
         markers[uid] = { marker: m, sig: sig };
       } else {
         entry.marker.setLatLng([p.lat, p.lng]);
         if (entry.sig !== sig) {
-          entry.marker.setIcon(L.divIcon({ className: 'blip', html: markerHtml(p, isMe, stale), iconSize: [0, 0] }));
+          entry.marker.setIcon(L.divIcon({ className: 'blip', html: markerHtml(p, isMe, stale, selected), iconSize: [0, 0] }));
+          entry.marker.setZIndexOffset(isMe ? 1000 : (selected ? 800 : 0));
           entry.sig = sig;
         }
       }
@@ -226,6 +238,8 @@
 
     renderCounts(liveCount);
     renderRoster(now);
+    updateMeetup(now);
+    updateIncoming(now);
   }
 
   function removeMarker(uid) {
@@ -268,17 +282,21 @@
       });
 
     var sig = rows.map(function (r) {
-      return [r.uid, r.p.name, r.p.hue, formatDist(r.dist), r.stale, r.isMe].join('|');
+      var incoming = r.p.target === myPid;
+      return [r.uid, r.p.name, r.p.hue, formatDist(r.dist), r.stale, r.isMe, r.uid === selectedPid, incoming].join('|');
     }).join(';');
     if (sig === rosterSig) return;
     rosterSig = sig;
 
     elRoster.innerHTML = '';
     rows.forEach(function (r) {
+      var isSelected = r.uid === selectedPid;
+      var isIncoming = !r.isMe && r.p.target === myPid;
       var chip = document.createElement('button');
-      chip.className = 'chip' + (r.isMe ? ' chip-me' : '');
+      chip.className = 'chip' + (r.isMe ? ' chip-me' : '') + (isSelected ? ' chip-selected' : '') + (isIncoming ? ' chip-incoming' : '');
       chip.type = 'button';
-      chip.setAttribute('aria-label', (r.p.name || '?') + (r.isMe ? ', moi' : ', à ' + formatDist(r.dist)));
+      chip.setAttribute('aria-label',
+        (r.p.name || '?') + (r.isMe ? ', moi' : ', à ' + formatDist(r.dist) + (isSelected ? ', rendez-vous en cours' : ', appuie pour rejoindre')));
       if (r.stale) chip.style.opacity = '0.45';
 
       var dot = document.createElement('span');
@@ -291,12 +309,12 @@
 
       var dist = document.createElement('span');
       dist.className = 'chip-dist';
-      dist.textContent = r.isMe ? 'moi' : formatDist(r.dist);
+      dist.textContent = r.isMe ? 'moi' : (isSelected ? '● rdv' : formatDist(r.dist));
 
       chip.appendChild(dot);
       chip.appendChild(name);
       chip.appendChild(dist);
-      chip.addEventListener('click', function () { panTo([r.p.lat, r.p.lng]); });
+      chip.addEventListener('click', (function (id) { return function () { onPersonClick(id); }; })(r.uid));
       elRoster.appendChild(chip);
     });
   }
@@ -325,6 +343,243 @@
       });
     }
     knownUids = newUids;
+  }
+
+  // ---------- Rendez-vous (« se rejoindre ») ----------
+  var followBeforeMeet = true;     // suivi carte à restaurer après annulation
+  var broadcastTimer = null;
+
+  function onPersonClick(pid) {
+    var p = people[pid];
+    if (!p) return;
+    if (pid === myPid) {
+      // Clic sur soi : simple recentrage
+      follow = true;
+      panTo([p.lat, p.lng], Math.max(map.getZoom(), 15));
+      return;
+    }
+    // Refuser une cible périmée (sinon rdv auto-annulé + toasts contradictoires)
+    if ((serverNow() - (p.t || 0)) > STALE_MS) {
+      toast((p.name || 'Cette personne') + ' n’est plus assez récent pour un rendez-vous', true);
+      return;
+    }
+    if (selectedPid === pid) {
+      clearMeet();                 // reclic sur la même personne = annuler
+    } else {
+      selectMeet(pid);
+    }
+  }
+
+  function selectMeet(pid) {
+    var p = people[pid];
+    if (!p) return;
+    if (!selectedPid) followBeforeMeet = follow;  // mémoriser avant de figer le suivi
+    selectedPid = pid;
+    meetSamples = [];
+    rosterSig = '';                // forcer le re-rendu des chips (état sélection)
+    toast('🎯 Cap sur ' + (p.name || '?') + ' — suis le trait', false, true);
+    follow = false;
+    // cadrer les deux points
+    if (lastPayload) {
+      suppressMoveEvents = true;
+      map.fitBounds(L.latLngBounds([[lastPayload.lat, lastPayload.lng], [p.lat, p.lng]]).pad(0.3), { maxZoom: 16 });
+      setTimeout(function () { suppressMoveEvents = false; }, 900);
+    }
+    broadcastSelection();          // la cible verra « X vient te rejoindre »
+    doRepaint();
+  }
+
+  function clearMeet(silent) {
+    if (!selectedPid) return;
+    var prev = people[selectedPid];
+    selectedPid = null;
+    meetSamples = [];
+    rosterSig = '';
+    follow = followBeforeMeet;     // restaurer le suivi tel qu'avant la sélection
+    hideMeetup();
+    if (!silent && prev) toast('Rendez-vous annulé', true);
+    broadcastSelection();
+    doRepaint();
+  }
+
+  // Écrit (ou retire) la cible dans ma présence — coalescé pour éviter le spam d'écritures
+  function broadcastSelection() {
+    if (!joined) return;
+    var desired = (selectedPid && selectedPid !== myPid) ? selectedPid : null;
+    var current = lastPayload ? (lastPayload.target || null) : null;
+    if (desired === current) return;             // rien de nouveau à publier
+    if (broadcastTimer) return;                  // une écriture est déjà planifiée
+    broadcastTimer = setTimeout(function () {
+      broadcastTimer = null;
+      var want = (selectedPid && selectedPid !== myPid) ? selectedPid : null;
+      var have = lastPayload ? (lastPayload.target || null) : null;
+      if (want !== have && joined && lastFix) writeFix(lastFix, true);
+    }, 400);
+  }
+
+  // temps restant à un rythme donné -> texte
+  function formatEta(sec) {
+    if (!isFinite(sec) || sec <= 0) return null;
+    if (sec < 60) return 'moins d’1 min';
+    var m = Math.round(sec / 60);
+    if (m < 60) return m + ' min';
+    var h = Math.floor(m / 60), mm = m % 60;
+    return h + ' h' + (mm ? ' ' + (mm < 10 ? '0' : '') + mm : '');
+  }
+
+  // Pente de la distance dans le temps (m/s) par moindres carrés sur la fenêtre.
+  // closing = -pente (>0 : on se rapproche).
+  function closingSpeed(samples) {
+    var n = samples.length;
+    if (n < 3) return null;
+    var t0 = samples[0].t;
+    var sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (var i = 0; i < n; i++) {
+      var x = (samples[i].t - t0) / 1000, y = samples[i].d;
+      sx += x; sy += y; sxx += x * x; sxy += x * y;
+    }
+    var denom = n * sxx - sx * sx;
+    if (denom === 0) return null;
+    var slope = (n * sxy - sx * sy) / denom;   // m/s (distance qui varie)
+    return -slope;
+  }
+
+  function updateMeetup(now) {
+    if (!joined || !selectedPid || !lastPayload) {
+      hideMeetup();
+      return;
+    }
+    var target = people[selectedPid];
+    // Cible partie / périmée : on annule proprement
+    if (!target || typeof target.lat !== 'number' || (now - (target.t || 0)) > STALE_MS) {
+      var name = target ? target.name : 'La personne';
+      toast((name || 'La personne') + ' n’est plus joignable', true);
+      clearMeet(true);
+      return;
+    }
+
+    var d = haversine(lastPayload.lat, lastPayload.lng, target.lat, target.lng);
+    var nowMs = Date.now();
+    meetSamples.push({ t: nowMs, d: d });
+    meetSamples = meetSamples.filter(function (s) { return nowMs - s.t <= 20000; }); // fenêtre 20 s
+
+    var closing = closingSpeed(meetSamples);
+    var span = meetSamples.length >= 2
+      ? Math.abs(meetSamples[0].d - meetSamples[meetSamples.length - 1].d) : 0;
+    var dt = meetSamples.length >= 2
+      ? (meetSamples[meetSamples.length - 1].t - meetSamples[0].t) / 1000 : 0;
+    // Mesure fiable = assez de recul (≥10 s), déplacement net au-dessus du bruit
+    // d'arrondi (~11 m) et amplitude plausible. Le rapprochement CUMULE les deux
+    // mobiles → plafond relatif élevé (~70 m/s). Le signe donne le sens.
+    var reliable = closing !== null && dt >= 10 && span >= 25 && Math.abs(closing) <= 70;
+    var approaching = reliable && closing > 0.5;
+
+    var subHtml;
+    if (d < 30) {
+      subHtml = '<span class="meet-arrived">Vous y êtes 🎉</span>';
+    } else if (d > 40000) {
+      subHtml = formatDist(d) + ' <span class="meet-eta-src">trop loin pour estimer</span>';
+    } else if (reliable && closing < -0.5) {
+      subHtml = formatDist(d) + ' <span class="meet-eta-src">vous vous éloignez</span>';
+    } else {
+      var etaSec = approaching ? d / closing : d / 1.35;
+      var source = approaching ? 'à ce rythme' : 'à pied env.';
+      if (etaSec > 3 * 3600) {
+        subHtml = formatDist(d) + ' <span class="meet-eta-src">trop loin pour estimer</span>';
+      } else {
+        var eta = formatEta(etaSec);
+        subHtml = formatDist(d) + (eta ? ' · ' + eta + ' <span class="meet-eta-src">' + source + '</span>' : '');
+      }
+    }
+
+    var confirmed = target.target === myPid; // rendez-vous mutuel
+    var nameHtml = 'Cap sur <b>' + escapeHtml(target.name || '?') + '</b>' +
+      (confirmed ? ' · <span class="meet-confirm">vous vous rejoignez</span>' : '');
+
+    elMeetDot.style.setProperty('--c', colorFor(target.hue || 0));
+    // N'écrire le DOM que si le texte change (évite le matraquage du lecteur d'écran)
+    if (nameHtml !== meetNameTxt) { elMeetName.innerHTML = nameHtml; meetNameTxt = nameHtml; }
+    if (subHtml !== meetSubTxt) { elMeetSub.innerHTML = subHtml; meetSubTxt = subHtml; }
+
+    elMeetup.classList.remove('hidden');
+    document.body.classList.add('has-meet');
+    drawMeetLine([lastPayload.lat, lastPayload.lng], [target.lat, target.lng], confirmed);
+  }
+
+  function hideMeetup() {
+    elMeetup.classList.add('hidden');
+    document.body.classList.remove('has-meet');
+    meetNameTxt = ''; meetSubTxt = '';
+    clearMeetLine();
+  }
+
+  function drawMeetLine(from, to, confirmed) {
+    var opts = {
+      color: confirmed ? '#0f9d8c' : '#f97316',
+      weight: confirmed ? 4 : 3,
+      opacity: 0.85,
+      dashArray: confirmed ? null : '2 8',
+      lineCap: 'round',
+      interactive: false
+    };
+    if (!meetLine) {
+      meetLine = L.polyline([from, to], opts).addTo(map);
+    } else {
+      meetLine.setLatLngs([from, to]);
+      meetLine.setStyle(opts);
+    }
+  }
+
+  function clearMeetLine() {
+    if (meetLine) { meetLine.remove(); meetLine = null; }
+  }
+
+  // Lignes de ceux qui me visent (« X vient vers moi ») + toast anti-répétition
+  var INCOMING_MAX_LINES = 12;     // plafond anti-surcharge (mobile)
+  var INCOMING_TOAST_COOLDOWN = 5 * 60 * 1000;
+  function updateIncoming(now) {
+    var targetingMe = {};          // me vise réellement (indépendant de la fraîcheur)
+    var drawn = 0;
+    if (joined && lastPayload) {
+      Object.keys(people).forEach(function (pid) {
+        if (pid === myPid) return;
+        var p = people[pid];
+        if (!p || typeof p.lat !== 'number' || p.target !== myPid) return;
+        targetingMe[pid] = true;
+        if ((now - (p.t || 0)) > STALE_MS) return;  // trop vieux : ni toast ni trait
+
+        // Toast au plus une fois par période, même si la personne oscille stale/frais
+        var last = knownIncoming[pid] || 0;
+        if (now - last > INCOMING_TOAST_COOLDOWN) {
+          knownIncoming[pid] = now;
+          toast('🎯 ' + (p.name || '?') + ' vient te rejoindre', false, true);
+        }
+        // Pas de doublon avec mon propre trait si je l'ai aussi sélectionné
+        if (pid === selectedPid) { removeIncomingLine(pid); return; }
+        if (drawn >= INCOMING_MAX_LINES) { removeIncomingLine(pid); return; }
+        drawn++;
+        var opts = { color: colorFor(p.hue || 0), weight: 2.5, opacity: 0.6, dashArray: '2 7', lineCap: 'round', interactive: false };
+        if (!incomingLines[pid]) {
+          incomingLines[pid] = L.polyline([[p.lat, p.lng], [lastPayload.lat, lastPayload.lng]], opts).addTo(map);
+        } else {
+          incomingLines[pid].setLatLngs([[p.lat, p.lng], [lastPayload.lat, lastPayload.lng]]);
+          incomingLines[pid].setStyle(opts);
+        }
+      });
+    }
+    // Retirer les traits de ceux qui ne sont plus frais / ne me visent plus
+    Object.keys(incomingLines).forEach(function (pid) {
+      var p = people[pid];
+      if (!p || p.target !== myPid || (now - (p.t || 0)) > STALE_MS || pid === selectedPid) removeIncomingLine(pid);
+    });
+    // Purger le flag anti-répétition SEULEMENT quand la personne cesse vraiment de me viser
+    Object.keys(knownIncoming).forEach(function (pid) {
+      if (!targetingMe[pid]) delete knownIncoming[pid];
+    });
+  }
+
+  function removeIncomingLine(pid) {
+    if (incomingLines[pid]) { incomingLines[pid].remove(); delete incomingLines[pid]; }
   }
 
   // ---------- Firebase ----------
@@ -391,7 +646,7 @@
   }
 
   function payloadFrom(fix, name, hue) {
-    return {
+    var payload = {
       owner: myUid,
       name: name,
       lat: roundCoord(fix.coords.latitude),
@@ -400,6 +655,9 @@
       hue: hue,
       t: firebase.database.ServerValue.TIMESTAMP
     };
+    // Qui je cherche à rejoindre (si sélection active) — sinon clé omise
+    if (selectedPid && selectedPid !== myPid) payload.target = selectedPid;
+    return payload;
   }
 
   function writeFix(fix, force) {
@@ -571,6 +829,14 @@
     }
     lastPayload = null;
     lastWriteAt = 0;
+    // Réinitialiser l'état rendez-vous
+    selectedPid = null;
+    meetSamples = [];
+    knownIncoming = {};
+    clearMeetLine();
+    Object.keys(incomingLines).forEach(removeIncomingLine);
+    elMeetup.classList.add('hidden');
+    document.body.classList.remove('has-meet');
     if (accCircle) { accCircle.remove(); accCircle = null; }
     follow = true;
     document.body.classList.add('gated');
@@ -605,6 +871,7 @@
   });
   $('btn-quit').addEventListener('click', quit);
   $('btn-share').addEventListener('click', share);
+  $('meet-close').addEventListener('click', function () { clearMeet(); });
   $('btn-center').addEventListener('click', function () {
     follow = true;
     if (lastPayload) panTo([lastPayload.lat, lastPayload.lng], Math.max(map.getZoom(), 15));

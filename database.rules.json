@@ -5,7 +5,7 @@
     "presence": {
       ".read": "auth != null",
       "$pid": {
-        ".write": "auth != null && ((newData.exists() && newData.child('owner').val() === auth.uid) || (!newData.exists() && data.exists() && (data.child('owner').val() === auth.uid || data.child('t').val() < now - 600000)))",
+        ".write": "auth != null && ((newData.exists() && newData.child('owner').val() === auth.uid && $pid.beginsWith(auth.uid + '-')) || (!newData.exists() && data.exists() && (data.child('owner').val() === auth.uid || data.child('t').val() < now - 600000)))",
         ".validate": "newData.hasChildren(['owner', 'name', 'lat', 'lng', 't', 'hue', 'acc'])",
         "owner": {
           ".validate": "newData.isString() && newData.val() === auth.uid"
@@ -27,6 +27,9 @@
         },
         "t": {
           ".validate": "newData.isNumber() && newData.val() === now"
+        },
+        "target": {
+          ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length <= 80"
         },
         "$other": { ".validate": false }
       }
