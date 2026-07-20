@@ -30,6 +30,8 @@
   var elCallsign = $('callsign'), elJoin = $('btn-join'), elReroll = $('btn-reroll');
   var elHud = $('hud'), elHudCount = $('hud-count'), elRoster = $('roster'), elToasts = $('toasts');
   var elMeetup = $('meetup'), elMeetDot = $('meet-dot'), elMeetName = $('meet-name'), elMeetSub = $('meet-sub');
+  var elTestbox = $('testbox'), elTestAddr = $('test-addr'), elTestGo = $('test-go'),
+      elTestStatus = $('test-status'), elTestRemove = $('test-remove'), elBtnTest = $('btn-test');
 
   // ---------- État ----------
   var map, tiles;
@@ -61,6 +63,9 @@
   var knownIncoming = {};        // pid -> timestamp du dernier toast « X vient te rejoindre »
   var meetNameTxt = '';          // dernier HTML écrit (évite la ré-annonce lecteur d'écran)
   var meetSubTxt = '';
+  // ---- Point de test (destination fictive locale, jamais écrite en base) ----
+  var TEST_PID = '__test__';
+  var testPoint = null;          // { name, lat, lng, hue }
 
   // ---------- Utilitaires ----------
   function escapeHtml(s) {
@@ -171,6 +176,7 @@
 
   function doRepaint() {
     var now = serverNow();
+    if (testPoint) people[TEST_PID] = testEntry();  // destination fictive, toujours fraîche
     var uids = Object.keys(people);
     var liveCount = 0;
 
@@ -180,7 +186,7 @@
       var age = now - (p.t || 0);
 
       // Nettoyage des zombies (crash sans onDisconnect) — une tentative max
-      if (age > ZOMBIE_MS && uid !== myPid) {
+      if (age > ZOMBIE_MS && uid !== myPid && uid !== TEST_PID) {
         if (joined && !cleanedUids[uid]) {
           cleanedUids[uid] = true;
           db.ref('presence/' + uid).remove().catch(function () {});
@@ -402,18 +408,21 @@
     doRepaint();
   }
 
+  // Cible réellement publiable (le point de test reste local, jamais en base)
+  function publishableTarget() {
+    return (selectedPid && selectedPid !== myPid && selectedPid !== TEST_PID) ? selectedPid : null;
+  }
+
   // Écrit (ou retire) la cible dans ma présence — coalescé pour éviter le spam d'écritures
   function broadcastSelection() {
     if (!joined) return;
-    var desired = (selectedPid && selectedPid !== myPid) ? selectedPid : null;
     var current = lastPayload ? (lastPayload.target || null) : null;
-    if (desired === current) return;             // rien de nouveau à publier
+    if (publishableTarget() === current) return; // rien de nouveau à publier
     if (broadcastTimer) return;                  // une écriture est déjà planifiée
     broadcastTimer = setTimeout(function () {
       broadcastTimer = null;
-      var want = (selectedPid && selectedPid !== myPid) ? selectedPid : null;
       var have = lastPayload ? (lastPayload.target || null) : null;
-      if (want !== have && joined && lastFix) writeFix(lastFix, true);
+      if (publishableTarget() !== have && joined && lastFix) writeFix(lastFix, true);
     }, 400);
   }
 
@@ -582,6 +591,71 @@
     if (incomingLines[pid]) { incomingLines[pid].remove(); delete incomingLines[pid]; }
   }
 
+  // ---------- Point de test (destination fictive pour essayer seul) ----------
+  function testEntry() {
+    return { owner: myUid || '', name: testPoint.name, lat: testPoint.lat, lng: testPoint.lng,
+             acc: 0, hue: testPoint.hue, t: serverNow() };
+  }
+
+  function toggleTestbox() {
+    if (!joined) return;
+    var willShow = elTestbox.classList.contains('hidden');
+    elTestbox.classList.toggle('hidden', !willShow);
+    elBtnTest.classList.toggle('active', willShow);
+    if (willShow) {
+      elTestRemove.classList.toggle('hidden', !testPoint);
+      setTimeout(function () { elTestAddr.focus(); }, 60);
+    }
+  }
+
+  function setTestStatus(msg, err) {
+    elTestStatus.textContent = msg;
+    elTestStatus.classList.toggle('err', !!err);
+  }
+
+  // Géocodage via Photon (OpenStreetMap, gratuit, CORS ouvert, sans clé)
+  function geocode(q) {
+    var url = 'https://photon.komoot.io/api/?limit=1&lang=fr&q=' + encodeURIComponent(q);
+    return fetch(url).then(function (r) { return r.json(); }).then(function (j) {
+      if (!j || !j.features || !j.features.length) return null;
+      var c = j.features[0].geometry && j.features[0].geometry.coordinates;
+      if (!c || typeof c[0] !== 'number' || typeof c[1] !== 'number') return null;
+      return { lat: c[1], lng: c[0] };
+    });
+  }
+
+  function placeTest() {
+    var q = (elTestAddr.value || '').trim();
+    if (!q) { setTestStatus('Entre d’abord une adresse.', true); return; }
+    elTestGo.disabled = true;
+    setTestStatus('Recherche de l’adresse…');
+    geocode(q).then(function (res) {
+      elTestGo.disabled = false;
+      if (!res) { setTestStatus('Adresse introuvable — précise-la (ville, pays).', true); return; }
+      testPoint = { name: 'Test', lat: res.lat, lng: res.lng, hue: 300 };
+      elTestRemove.classList.remove('hidden');
+      elTestbox.classList.add('hidden');
+      elBtnTest.classList.remove('active');
+      setTestStatus('');
+      doRepaint();               // fait apparaître le point tout de suite
+      selectMeet(TEST_PID);      // démarre le rendez-vous automatiquement
+    }).catch(function () {
+      elTestGo.disabled = false;
+      setTestStatus('Recherche impossible (réseau).', true);
+    });
+  }
+
+  function removeTest() {
+    if (selectedPid === TEST_PID) clearMeet(true);
+    testPoint = null;
+    delete people[TEST_PID];
+    removeMarker(TEST_PID);
+    knownUids && delete knownUids[TEST_PID];
+    elTestRemove.classList.add('hidden');
+    setTestStatus('Point Test retiré.');
+    doRepaint();
+  }
+
   // ---------- Firebase ----------
   function initFirebase() {
     firebase.initializeApp(window.RADAR_CONFIG);
@@ -655,8 +729,9 @@
       hue: hue,
       t: firebase.database.ServerValue.TIMESTAMP
     };
-    // Qui je cherche à rejoindre (si sélection active) — sinon clé omise
-    if (selectedPid && selectedPid !== myPid) payload.target = selectedPid;
+    // Qui je cherche à rejoindre (si sélection active, hors point de test) — sinon clé omise
+    var pub = publishableTarget();
+    if (pub) payload.target = pub;
     return payload;
   }
 
@@ -837,6 +912,11 @@
     Object.keys(incomingLines).forEach(removeIncomingLine);
     elMeetup.classList.add('hidden');
     document.body.classList.remove('has-meet');
+    // Réinitialiser le point de test
+    if (testPoint) { testPoint = null; removeMarker(TEST_PID); delete people[TEST_PID]; }
+    elTestbox.classList.add('hidden');
+    elTestRemove.classList.add('hidden');
+    elBtnTest.classList.remove('active');
     if (accCircle) { accCircle.remove(); accCircle = null; }
     follow = true;
     document.body.classList.add('gated');
@@ -872,6 +952,10 @@
   $('btn-quit').addEventListener('click', quit);
   $('btn-share').addEventListener('click', share);
   $('meet-close').addEventListener('click', function () { clearMeet(); });
+  elBtnTest.addEventListener('click', toggleTestbox);
+  elTestGo.addEventListener('click', placeTest);
+  elTestAddr.addEventListener('keydown', function (e) { if (e.key === 'Enter') placeTest(); });
+  elTestRemove.addEventListener('click', removeTest);
   $('btn-center').addEventListener('click', function () {
     follow = true;
     if (lastPayload) panTo([lastPayload.lat, lastPayload.lng], Math.max(map.getZoom(), 15));

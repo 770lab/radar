@@ -12,7 +12,7 @@
   <meta name="theme-color" content="#e8edf3">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📡</text></svg>">
   <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
-  <link rel="stylesheet" href="css/style.css?v=5">
+  <link rel="stylesheet" href="css/style.css?v=6">
 </head>
 <body>
 
@@ -27,11 +27,25 @@
     </div>
     <div class="hud-right">
       <span id="hud-count" class="hud-count">—</span>
+      <button id="btn-test" class="hud-btn hud-btn-test" title="Ajouter un point de test" aria-label="Ajouter un point de test">＋</button>
       <button id="btn-share" class="hud-btn" title="Partager le lien" aria-label="Partager le lien">⇗</button>
       <button id="btn-center" class="hud-btn" title="Me recentrer" aria-label="Me recentrer">◎</button>
       <button id="btn-quit" class="hud-btn hud-btn-quit" title="Quitter le radar" aria-label="Quitter le radar">✕</button>
     </div>
   </header>
+
+  <!-- Boîte « point de test » (adresse à rejoindre) -->
+  <div id="testbox" class="hidden">
+    <div class="testbox-row">
+      <input id="test-addr" type="text" autocomplete="off" spellcheck="false"
+             placeholder="Adresse à rejoindre (ex. 10 rue de Rivoli, Paris)">
+      <button id="test-go" type="button">Placer</button>
+    </div>
+    <div class="testbox-foot">
+      <span id="test-status" class="test-status">Un point « Test » apparaîtra à cette adresse, clique-le pour t’y rendre.</span>
+      <button id="test-remove" class="test-remove hidden" type="button">Retirer le point Test</button>
+    </div>
+  </div>
 
   <!-- Bandeau rendez-vous (au-dessus du roster) -->
   <div id="meetup" class="hidden">
@@ -87,6 +101,6 @@
   <script src="vendor/firebase/firebase-app-compat.js"></script>
   <script src="vendor/firebase/firebase-auth-compat.js"></script>
   <script src="vendor/firebase/firebase-database-compat.js"></script>
-  <script src="js/app.js?v=5"></script>
+  <script src="js/app.js?v=6"></script>
 </body>
 </html>
