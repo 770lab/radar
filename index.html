@@ -12,7 +12,7 @@
   <meta name="theme-color" content="#e8edf3">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📡</text></svg>">
   <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
-  <link rel="stylesheet" href="css/style.css?v=6">
+  <link rel="stylesheet" href="css/style.css?v=7">
 </head>
 <body>
 
@@ -37,10 +37,12 @@
   <!-- Boîte « point de test » (adresse à rejoindre) -->
   <div id="testbox" class="hidden">
     <div class="testbox-row">
-      <input id="test-addr" type="text" autocomplete="off" spellcheck="false"
+      <input id="test-addr" type="text" autocomplete="off" spellcheck="false" role="combobox"
+             aria-autocomplete="list" aria-expanded="false" aria-controls="test-suggest"
              placeholder="Adresse à rejoindre (ex. 10 rue de Rivoli, Paris)">
       <button id="test-go" type="button">Placer</button>
     </div>
+    <ul id="test-suggest" class="hidden" role="listbox" aria-label="Suggestions d’adresses"></ul>
     <div class="testbox-foot">
       <span id="test-status" class="test-status">Un point « Test » apparaîtra à cette adresse, clique-le pour t’y rendre.</span>
       <button id="test-remove" class="test-remove hidden" type="button">Retirer le point Test</button>
@@ -101,6 +103,6 @@
   <script src="vendor/firebase/firebase-app-compat.js"></script>
   <script src="vendor/firebase/firebase-auth-compat.js"></script>
   <script src="vendor/firebase/firebase-database-compat.js"></script>
-  <script src="js/app.js?v=6"></script>
+  <script src="js/app.js?v=7"></script>
 </body>
 </html>

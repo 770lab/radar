@@ -31,7 +31,8 @@
   var elHud = $('hud'), elHudCount = $('hud-count'), elRoster = $('roster'), elToasts = $('toasts');
   var elMeetup = $('meetup'), elMeetDot = $('meet-dot'), elMeetName = $('meet-name'), elMeetSub = $('meet-sub');
   var elTestbox = $('testbox'), elTestAddr = $('test-addr'), elTestGo = $('test-go'),
-      elTestStatus = $('test-status'), elTestRemove = $('test-remove'), elBtnTest = $('btn-test');
+      elTestStatus = $('test-status'), elTestRemove = $('test-remove'), elBtnTest = $('btn-test'),
+      elTestSuggest = $('test-suggest');
 
   // ---------- État ----------
   var map, tiles;
@@ -66,6 +67,13 @@
   // ---- Point de test (destination fictive locale, jamais écrite en base) ----
   var TEST_PID = '__test__';
   var testPoint = null;          // { name, lat, lng, hue }
+  var suggestItems = [];         // suggestions d'adresses courantes
+  var suggestActive = -1;        // index surligné au clavier
+  var suggestTimer = null;
+  // ---- Itinéraire piéton réel (suit les rues) ----
+  var route = null;              // { coords:[[lat,lng]], distance, duration, from, to, at }
+  var routeFetching = false;
+  var routeFailed = false;
 
   // ---------- Utilitaires ----------
   function escapeHtml(s) {
@@ -382,6 +390,7 @@
     if (!selectedPid) followBeforeMeet = follow;  // mémoriser avant de figer le suivi
     selectedPid = pid;
     meetSamples = [];
+    route = null; routeFailed = false;            // itinéraire à recalculer pour cette cible
     rosterSig = '';                // forcer le re-rendu des chips (état sélection)
     toast('🎯 Cap sur ' + (p.name || '?') + ' — suis le trait', false, true);
     follow = false;
@@ -458,6 +467,9 @@
       hideMeetup();
       return;
     }
+    // Le point de test ne « part » jamais : on le garde frais même si un
+    // snapshot vient d'écraser people (updateMeetup peut être appelé hors doRepaint).
+    if (selectedPid === TEST_PID && testPoint) people[TEST_PID] = testEntry();
     var target = people[selectedPid];
     // Cible partie / périmée : on annule proprement
     if (!target || typeof target.lat !== 'number' || (now - (target.t || 0)) > STALE_MS) {
@@ -467,41 +479,52 @@
       return;
     }
 
-    var d = haversine(lastPayload.lat, lastPayload.lng, target.lat, target.lng);
-    var nowMs = Date.now();
-    meetSamples.push({ t: nowMs, d: d });
-    meetSamples = meetSamples.filter(function (s) { return nowMs - s.t <= 20000; }); // fenêtre 20 s
+    var me = [lastPayload.lat, lastPayload.lng];
+    var to = [target.lat, target.lng];
+    var d = haversine(me[0], me[1], to[0], to[1]); // à vol d'oiseau (détection d'arrivée)
 
-    var closing = closingSpeed(meetSamples);
-    var span = meetSamples.length >= 2
-      ? Math.abs(meetSamples[0].d - meetSamples[meetSamples.length - 1].d) : 0;
-    var dt = meetSamples.length >= 2
-      ? (meetSamples[meetSamples.length - 1].t - meetSamples[0].t) / 1000 : 0;
-    // Mesure fiable = assez de recul (≥10 s), déplacement net au-dessus du bruit
-    // d'arrondi (~11 m) et amplitude plausible. Le rapprochement CUMULE les deux
-    // mobiles → plafond relatif élevé (~70 m/s). Le signe donne le sens.
-    var reliable = closing !== null && dt >= 10 && span >= 25 && Math.abs(closing) <= 70;
-    var approaching = reliable && closing > 0.5;
+    // Itinéraire piéton réel : on le (re)calcule si besoin (bornes bougé/temps)
+    maybeFetchRoute(me, to);
+    var routeValid = route && !routeFailed &&
+      haversine(me[0], me[1], route.from[0], route.from[1]) < 60 &&
+      haversine(to[0], to[1], route.to[0], route.to[1]) < 60;
+
+    var confirmed = target.target === myPid; // rendez-vous mutuel
 
     var subHtml;
     if (d < 30) {
       subHtml = '<span class="meet-arrived">Vous y êtes 🎉</span>';
-    } else if (d > 40000) {
-      subHtml = formatDist(d) + ' <span class="meet-eta-src">trop loin pour estimer</span>';
-    } else if (reliable && closing < -0.5) {
-      subHtml = formatDist(d) + ' <span class="meet-eta-src">vous vous éloignez</span>';
+    } else if (routeValid) {
+      // Distance et durée d'un VRAI trajet à pied qui suit les rues
+      var eta = formatEta(route.duration);
+      subHtml = formatDist(route.distance) +
+        (eta ? ' · ' + eta + ' <span class="meet-eta-src">à pied · par les rues</span>' : '');
     } else {
-      var etaSec = approaching ? d / closing : d / 1.35;
-      var source = approaching ? 'à ce rythme' : 'à pied env.';
-      if (etaSec > 3 * 3600) {
+      // Repli (itinéraire en cours de calcul ou indisponible) : à vol d'oiseau
+      var nowMs = Date.now();
+      meetSamples.push({ t: nowMs, d: d });
+      meetSamples = meetSamples.filter(function (s) { return nowMs - s.t <= 20000; });
+      var closing = closingSpeed(meetSamples);
+      var span = meetSamples.length >= 2 ? Math.abs(meetSamples[0].d - meetSamples[meetSamples.length - 1].d) : 0;
+      var dt = meetSamples.length >= 2 ? (meetSamples[meetSamples.length - 1].t - meetSamples[0].t) / 1000 : 0;
+      var reliable = closing !== null && dt >= 10 && span >= 25 && Math.abs(closing) <= 70;
+      var approaching = reliable && closing > 0.5;
+      if (d > 40000) {
         subHtml = formatDist(d) + ' <span class="meet-eta-src">trop loin pour estimer</span>';
+      } else if (reliable && closing < -0.5) {
+        subHtml = formatDist(d) + ' <span class="meet-eta-src">vous vous éloignez</span>';
       } else {
-        var eta = formatEta(etaSec);
-        subHtml = formatDist(d) + (eta ? ' · ' + eta + ' <span class="meet-eta-src">' + source + '</span>' : '');
+        var etaSec = approaching ? d / closing : d / 1.35;
+        var src = routeFailed ? (approaching ? 'à ce rythme' : 'à vol d’oiseau') : 'itinéraire…';
+        if (etaSec > 3 * 3600) {
+          subHtml = formatDist(d) + ' <span class="meet-eta-src">trop loin pour estimer</span>';
+        } else {
+          var e2 = formatEta(etaSec);
+          subHtml = formatDist(d) + (e2 ? ' · ' + e2 + ' <span class="meet-eta-src">' + src + '</span>' : '');
+        }
       }
     }
 
-    var confirmed = target.target === myPid; // rendez-vous mutuel
     var nameHtml = 'Cap sur <b>' + escapeHtml(target.name || '?') + '</b>' +
       (confirmed ? ' · <span class="meet-confirm">vous vous rejoignez</span>' : '');
 
@@ -512,29 +535,31 @@
 
     elMeetup.classList.remove('hidden');
     document.body.classList.add('has-meet');
-    drawMeetLine([lastPayload.lat, lastPayload.lng], [target.lat, target.lng], confirmed);
+    // Le trait suit l'itinéraire réel s'il est prêt, sinon segment direct
+    drawMeetLine(routeValid ? route.coords : [me, to], confirmed);
   }
 
   function hideMeetup() {
     elMeetup.classList.add('hidden');
     document.body.classList.remove('has-meet');
     meetNameTxt = ''; meetSubTxt = '';
+    route = null; routeFailed = false;
     clearMeetLine();
   }
 
-  function drawMeetLine(from, to, confirmed) {
+  function drawMeetLine(latlngs, confirmed) {
     var opts = {
       color: confirmed ? '#0f9d8c' : '#f97316',
-      weight: confirmed ? 4 : 3,
-      opacity: 0.85,
-      dashArray: confirmed ? null : '2 8',
+      weight: confirmed ? 5 : 4,
+      opacity: 0.9,
       lineCap: 'round',
+      lineJoin: 'round',
       interactive: false
     };
     if (!meetLine) {
-      meetLine = L.polyline([from, to], opts).addTo(map);
+      meetLine = L.polyline(latlngs, opts).addTo(map);
     } else {
-      meetLine.setLatLngs([from, to]);
+      meetLine.setLatLngs(latlngs);
       meetLine.setStyle(opts);
     }
   }
@@ -614,14 +639,36 @@
   }
 
   // Géocodage via Photon (OpenStreetMap, gratuit, CORS ouvert, sans clé)
-  function geocode(q) {
-    var url = 'https://photon.komoot.io/api/?limit=1&lang=fr&q=' + encodeURIComponent(q);
+  // Retourne une liste [{lat, lng, main, sub}] (autocomplétion).
+  function geocodeList(q, limit) {
+    var url = 'https://photon.komoot.io/api/?limit=' + (limit || 5) + '&lang=fr&q=' + encodeURIComponent(q);
     return fetch(url).then(function (r) { return r.json(); }).then(function (j) {
-      if (!j || !j.features || !j.features.length) return null;
-      var c = j.features[0].geometry && j.features[0].geometry.coordinates;
-      if (!c || typeof c[0] !== 'number' || typeof c[1] !== 'number') return null;
-      return { lat: c[1], lng: c[0] };
+      if (!j || !j.features) return [];
+      return j.features.map(function (f) {
+        var c = f.geometry && f.geometry.coordinates, p = f.properties || {};
+        if (!c || typeof c[0] !== 'number' || typeof c[1] !== 'number') return null;
+        var street = p.housenumber ? (p.housenumber + ' ' + (p.street || '')).trim() : (p.street || '');
+        var main = p.name || street || p.city || 'Lieu';
+        if (p.name && street && p.name !== street) main = p.name; // POI garde son nom
+        var loc = [street && street !== main ? street : null,
+                   p.postcode, p.city || p.town || p.village, p.country]
+                  .filter(Boolean).join(', ');
+        return { lat: c[1], lng: c[0], main: main, sub: loc };
+      }).filter(Boolean);
     });
+  }
+
+  function placeTestAt(lat, lng, label) {
+    testPoint = { name: 'Test', lat: lat, lng: lng, hue: 300 };
+    route = null; routeFailed = false;   // recalcul de l'itinéraire pour la nouvelle cible
+    hideSuggest();
+    elTestRemove.classList.remove('hidden');
+    elTestbox.classList.add('hidden');
+    elBtnTest.classList.remove('active');
+    setTestStatus('');
+    if (label) elTestAddr.value = label;
+    doRepaint();               // fait apparaître le point tout de suite
+    selectMeet(TEST_PID);      // démarre le rendez-vous automatiquement
   }
 
   function placeTest() {
@@ -629,20 +676,78 @@
     if (!q) { setTestStatus('Entre d’abord une adresse.', true); return; }
     elTestGo.disabled = true;
     setTestStatus('Recherche de l’adresse…');
-    geocode(q).then(function (res) {
+    geocodeList(q, 1).then(function (list) {
       elTestGo.disabled = false;
-      if (!res) { setTestStatus('Adresse introuvable — précise-la (ville, pays).', true); return; }
-      testPoint = { name: 'Test', lat: res.lat, lng: res.lng, hue: 300 };
-      elTestRemove.classList.remove('hidden');
-      elTestbox.classList.add('hidden');
-      elBtnTest.classList.remove('active');
-      setTestStatus('');
-      doRepaint();               // fait apparaître le point tout de suite
-      selectMeet(TEST_PID);      // démarre le rendez-vous automatiquement
+      if (!list.length) { setTestStatus('Adresse introuvable — précise-la (ville, pays).', true); return; }
+      placeTestAt(list[0].lat, list[0].lng);
     }).catch(function () {
       elTestGo.disabled = false;
       setTestStatus('Recherche impossible (réseau).', true);
     });
+  }
+
+  // ---- Autocomplétion ----
+  function onAddrInput() {
+    var q = (elTestAddr.value || '').trim();
+    if (suggestTimer) clearTimeout(suggestTimer);
+    if (q.length < 3) { hideSuggest(); return; }
+    suggestTimer = setTimeout(function () {
+      geocodeList(q, 6).then(renderSuggest).catch(function () { hideSuggest(); });
+    }, 250);
+  }
+
+  function renderSuggest(list) {
+    suggestItems = list || [];
+    suggestActive = -1;
+    if (!suggestItems.length) { hideSuggest(); return; }
+    elTestSuggest.innerHTML = '';
+    suggestItems.forEach(function (s, i) {
+      var li = document.createElement('li');
+      li.setAttribute('role', 'option');
+      var m = document.createElement('span'); m.className = 's-main'; m.textContent = s.main;
+      var sub = document.createElement('span'); sub.className = 's-sub'; sub.textContent = s.sub || '';
+      li.appendChild(m); if (s.sub) li.appendChild(sub);
+      li.addEventListener('mousedown', function (e) { e.preventDefault(); chooseSuggest(i); });
+      elTestSuggest.appendChild(li);
+    });
+    elTestSuggest.classList.remove('hidden');
+    elTestAddr.setAttribute('aria-expanded', 'true');
+  }
+
+  function hideSuggest() {
+    elTestSuggest.classList.add('hidden');
+    elTestSuggest.innerHTML = '';
+    suggestItems = [];
+    suggestActive = -1;
+    elTestAddr.setAttribute('aria-expanded', 'false');
+  }
+
+  function highlightSuggest(idx) {
+    var items = elTestSuggest.children;
+    for (var i = 0; i < items.length; i++) items[i].classList.toggle('active', i === idx);
+    suggestActive = idx;
+  }
+
+  function chooseSuggest(i) {
+    var s = suggestItems[i];
+    if (!s) return;
+    placeTestAt(s.lat, s.lng, [s.main, s.sub].filter(Boolean).join(', '));
+  }
+
+  function onAddrKeydown(e) {
+    var n = suggestItems.length;
+    if (n && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+      e.preventDefault();
+      var idx = suggestActive + (e.key === 'ArrowDown' ? 1 : -1);
+      if (idx < 0) idx = n - 1; if (idx >= n) idx = 0;
+      highlightSuggest(idx);
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (suggestActive >= 0) chooseSuggest(suggestActive);
+      else placeTest();
+    } else if (e.key === 'Escape') {
+      hideSuggest();
+    }
   }
 
   function removeTest() {
@@ -651,9 +756,41 @@
     delete people[TEST_PID];
     removeMarker(TEST_PID);
     knownUids && delete knownUids[TEST_PID];
+    hideSuggest();
+    elTestAddr.value = '';
     elTestRemove.classList.add('hidden');
     setTestStatus('Point Test retiré.');
     doRepaint();
+  }
+
+  // ---------- Itinéraire piéton réel (suit les rues, via OSRM piéton FOSSGIS) ----------
+  function fetchRoute(from, to) {
+    var url = 'https://routing.openstreetmap.de/routed-foot/route/v1/foot/' +
+      from[1] + ',' + from[0] + ';' + to[1] + ',' + to[0] +
+      '?overview=full&geometries=geojson';
+    return fetch(url).then(function (r) { return r.json(); }).then(function (j) {
+      if (!j || j.code !== 'Ok' || !j.routes || !j.routes.length) return null;
+      var rt = j.routes[0];
+      var coords = (rt.geometry && rt.geometry.coordinates || []).map(function (c) { return [c[1], c[0]]; });
+      if (coords.length < 2) return null;
+      return { coords: coords, distance: rt.distance, duration: rt.duration };
+    });
+  }
+
+  function maybeFetchRoute(from, to) {
+    if (routeFetching) return;
+    var nowMs = Date.now();
+    if (route && (nowMs - route.at) < 9000 &&
+        haversine(from[0], from[1], route.from[0], route.from[1]) < 25 &&
+        haversine(to[0], to[1], route.to[0], route.to[1]) < 25) return;   // encore valable
+    routeFetching = true;
+    var rf = from, rt = to;
+    fetchRoute(from, to).then(function (r) {
+      routeFetching = false;
+      routeFailed = !r;
+      if (r) route = { coords: r.coords, distance: r.distance, duration: r.duration, from: rf, to: rt, at: Date.now() };
+      if (selectedPid) updateMeetup(serverNow());   // re-rendu avec l'itinéraire frais
+    }).catch(function () { routeFetching = false; routeFailed = true; });
   }
 
   // ---------- Firebase ----------
@@ -688,6 +825,7 @@
       var val = snap.val() || {};
       diffPresence(val);
       people = val;
+      if (testPoint) people[TEST_PID] = testEntry();  // ne jamais perdre le point de test
       repaint();
     }, function (err) {
       console.error('[radar] lecture presence:', err);
@@ -954,7 +1092,9 @@
   $('meet-close').addEventListener('click', function () { clearMeet(); });
   elBtnTest.addEventListener('click', toggleTestbox);
   elTestGo.addEventListener('click', placeTest);
-  elTestAddr.addEventListener('keydown', function (e) { if (e.key === 'Enter') placeTest(); });
+  elTestAddr.addEventListener('input', onAddrInput);
+  elTestAddr.addEventListener('keydown', onAddrKeydown);
+  elTestAddr.addEventListener('blur', function () { setTimeout(hideSuggest, 120); });
   elTestRemove.addEventListener('click', removeTest);
   $('btn-center').addEventListener('click', function () {
     follow = true;
