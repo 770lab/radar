@@ -67,10 +67,12 @@
   // ---- Point de test (destination fictive locale, jamais écrite en base) ----
   var TEST_PID = '__test__';
   var testPoint = null;          // { name, lat, lng, hue }
-  // ---- Itinéraire piéton réel (suit les rues) ----
+  // ---- Itinéraire réel (suit les rues) ----
   var route = null;              // { coords:[[lat,lng]], distance, duration, from, to, at }
   var routeFetching = false;
   var routeFailed = false;
+  var travelMode = 'WALKING';    // 'WALKING' | 'DRIVING' (persisté)
+  try { if (localStorage.getItem('radar_mode') === 'DRIVING') travelMode = 'DRIVING'; } catch (e) {}
 
   // ---------- Utilitaires ----------
   function escapeHtml(s) {
@@ -558,10 +560,10 @@
     if (d < 30) {
       subHtml = '<span class="meet-arrived">Vous y êtes 🎉</span>';
     } else if (routeValid) {
-      // Distance et durée d'un VRAI trajet à pied qui suit les rues
+      // Distance et durée d'un VRAI trajet qui suit les rues.
+      // Le mode (🚶/🚗) est déjà montré par le sélecteur actif du bandeau.
       var eta = formatEta(route.duration);
-      subHtml = formatDist(route.distance) +
-        (eta ? ' · ' + eta + ' <span class="meet-eta-src">à pied · par les rues</span>' : '');
+      subHtml = formatDist(route.distance) + (eta ? ' · ' + eta : '');
     } else {
       // Repli (itinéraire en cours de calcul ou indisponible) : à vol d'oiseau
       var nowMs = Date.now();
@@ -577,7 +579,9 @@
       } else if (reliable && closing < -0.5) {
         subHtml = formatDist(d) + ' <span class="meet-eta-src">vous vous éloignez</span>';
       } else {
-        var etaSec = approaching ? d / closing : d / 1.35;
+        // Repli : marche ~5 km/h, voiture ~30 km/h (ville)
+        var fallbackSpeed = travelMode === 'DRIVING' ? 8.3 : 1.35;
+        var etaSec = approaching ? d / closing : d / fallbackSpeed;
         var src = routeFailed ? (approaching ? 'à ce rythme' : 'à vol d’oiseau') : 'itinéraire…';
         if (etaSec > 3 * 3600) {
           subHtml = formatDist(d) + ' <span class="meet-eta-src">trop loin pour estimer</span>';
@@ -608,6 +612,22 @@
     meetNameTxt = ''; meetSubTxt = '';
     route = null; routeFailed = false;
     clearMeetLine();
+  }
+
+  // ---------- Mode de déplacement (🚶 / 🚗) ----------
+  function setTravelMode(mode) {
+    if (mode === travelMode) return;
+    travelMode = mode;
+    try { localStorage.setItem('radar_mode', mode); } catch (e) {}
+    refreshModeButtons();
+    route = null; routeFailed = false;   // recalcul de l'itinéraire dans le nouveau mode
+    meetSamples = [];                    // le rythme mesuré n'est plus comparable
+    if (selectedPid) updateMeetup(serverNow());
+  }
+
+  function refreshModeButtons() {
+    $('mode-walk').classList.toggle('on', travelMode === 'WALKING');
+    $('mode-drive').classList.toggle('on', travelMode === 'DRIVING');
   }
 
   var DASH_SYMBOL = { path: 'M 0,-1 0,1', strokeOpacity: 0.95, strokeWeight: 4, scale: 3 };
@@ -749,13 +769,13 @@
     doRepaint();
   }
 
-  // ---------- Itinéraire piéton réel (Google Routes API, computeRoutes) ----------
+  // ---------- Itinéraire réel (Google Routes API, computeRoutes) ----------
   function fetchRoute(from, to) {
     if (!googleRoutes) return Promise.resolve(null);
     return googleRoutes.Route.computeRoutes({
       origin: { lat: from[0], lng: from[1] },
       destination: { lat: to[0], lng: to[1] },
-      travelMode: 'WALKING',
+      travelMode: travelMode,
       fields: ['path', 'distanceMeters', 'durationMillis']
     }).then(function (res) {
       var r = res && res.routes && res.routes[0];
@@ -1088,6 +1108,8 @@
   $('btn-quit').addEventListener('click', quit);
   $('btn-share').addEventListener('click', share);
   $('meet-close').addEventListener('click', function () { clearMeet(); });
+  $('mode-walk').addEventListener('click', function () { setTravelMode('WALKING'); });
+  $('mode-drive').addEventListener('click', function () { setTravelMode('DRIVING'); });
   elBtnTest.addEventListener('click', toggleTestbox);
   elTestRemove.addEventListener('click', removeTest);
   $('btn-center').addEventListener('click', function () {
@@ -1120,6 +1142,7 @@
   try { savedName = localStorage.getItem('radar_name'); } catch (e) {}
   elCallsign.value = savedName || randomCallsign();
 
+  refreshModeButtons();
   initMap();
   initFirebase();
   repaintTimer = setInterval(repaint, 15000); // fraîcheur des états stale, même avant de rejoindre
